@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.Python
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Python egg metadata
+*.egg-info/
+.eggs/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Environment variables and logs
+.env
+*.log
+
+# IDE settings
+.vscode/
+.idea/
+
+# TensorBoard logs
+results/logs/
+tb_logs/
+
+# Models and checkpoints
+models/
+
+# PyBullet logs
+*.bullet
+
+# Misc
+.DS_Store
