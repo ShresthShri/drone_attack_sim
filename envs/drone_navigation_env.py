@@ -2,17 +2,17 @@
 
 from gym_pybullet_drones.envs.VelocityAviary import VelocityAviary
 from gym_pybullet_drones.utils.enums import ObservationType, ActionType, DroneModel, Physics
-import gym
+import gymnasium as gym 
 import numpy as np
 
 class DroneNavigationEnv(VelocityAviary):
-    def __init__(self):
+    def __init__(self, gui = False):
         super().__init__(
             drone_model=DroneModel.CF2X,                     # Default drone model
             num_drones=1,
             initial_xyzs=np.array([[0., 0., 1.]]),
             physics=Physics.PYB,
-            gui=False,
+            gui=gui,
             record=False
         )
         self.goal = np.array([5.0, 5.0, 1.0])  # Example goal position
