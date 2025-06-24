@@ -43,12 +43,16 @@ class DroneNavigationEnv(VelocityAviary):
         # Reward function weighting factors
         # W_Progress for moving towards the goal
         self.W_PROGRESS = 10.0
+        # Continous Proximity
+        self.W_GOAL_PROXIMITY = 5.0
         # W_Deviation for deviating from the straight path
         self.W_DEVIATION = 0.5
         # W_Collison for colliding
-        self.W_COLLISION = 100.0
+        self.W_COLLISION = 200.0 #Penalty increased from 100 to 200
         # W_Time for time spent in the episode 
         self.W_TIME = 0.1
+        # Penalty for large actions 
+        self.W_ACTION_MAGNITUDE = 0.01 
 
         # Obstacle setup
         self.obstacles_enabled = obstacles
@@ -153,11 +157,18 @@ class DroneNavigationEnv(VelocityAviary):
         # 5. Time Penalty
         time_penalty = -self.W_TIME
 
+        # Add continous proximity reward
+        proximity_reward = self.W_GOAL_PROXIMITY / (distance_to_goal + 0.1) # 0.1 to avoid div by zero
+
+        # Add Action magnitude penalty (Assuming action is a numpy array)
+        # THis helps prevent jerky movements and encourages smoother control
+        action_magnitude_penalty = -np.sum(np.square(self._last_action)) * self.W_ACTION_MAGNITUDE if hasattr(self, '_last_action') else 0
+
         # Combine all rewards
-        reward = progress_reward + goal_bonus + collision_penalty + deviation_penalty + time_penalty
+        reward = progress_reward + goal_bonus + collision_penalty + deviation_penalty + time_penalty + proximity_reward + action_magnitude_penalty
         
         # Clip the total reward
-        reward = np.clip(reward, -self.W_COLLISION - 50.0, 50.0 + self.W_PROGRESS * 10)
+        #reward = np.clip(reward, -self.W_COLLISION - 50.0, 50.0 + self.W_PROGRESS * 10)
 
         self._last_distance = distance_to_goal
         return reward
@@ -220,7 +231,7 @@ class DroneNavigationEnv(VelocityAviary):
         self._last_distance = None
 
         # Randomize goal position
-        # self.goal = np.random.uniform(low=[3.0, -3.0, 1.0], high=[7.0, 3.0, 2.0])
+        self.goal = np.random.uniform(low=[3.0, -3.0, 1.0], high=[7.0, 3.0, 2.0])
         
         # Update start position for deviation calculation
         self._start_pos = self.initial_xyzs[0].copy()

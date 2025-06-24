@@ -1,5 +1,3 @@
-# agents/train_sac.py (Fixed Version)
-
 import os
 import numpy as np
 from stable_baselines3 import SAC
@@ -10,83 +8,94 @@ from gymnasium.wrappers import TimeLimit
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
+from datetime import datetime # Import datetime for timestamping
 
 from envs.drone_navigation_env import DroneNavigationEnv
 
 def make_env(rank=0, seed=0, gui=False, max_steps=300, obstacles=True, monitor=True):
-    """
-    Create a wrapped environment for training.
-    
-    Args:
-        rank: The index of the subprocess
-        seed: The initial seed for RNG
-        gui: Whether to render GUI
-        max_steps: Maximum steps per episode
-        obstacles: Whether to include obstacles in the environment
-        monitor: Whether to wrap with Monitor (avoid double wrapping)
-    """
     def _init():
         env = DroneNavigationEnv(gui=gui, obstacles=obstacles)
         env = TimeLimit(env, max_episode_steps=max_steps)
         if monitor:
-            env = Monitor(env)  # Only add Monitor if requested
+            env = Monitor(env) 
         env.reset(seed=seed + rank)
         return env
     return _init
 
 
 def main():
-    # Create directories for saving models and logs
-    model_dir = "models/sac_baseline_obstacles"
-    log_dir = "results/logs_obstacles"
+    # Generate a timestamp for the current run
+    # Format: YYYY-MM-DD_HH-MM-SS (e.g., 2023-10-27_15-30-00)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    
+    # Define base directories for models and logs
+    base_model_dir = "models/sac_baseline_obstacles"
+    base_log_dir = "results/logs_obstacles"
+
+    # Create a unique directory name for this run using the timestamp
+    # This will result in directories like:
+    # models/sac_baseline_obstacles/2023-10-27_15-30-00_SAC
+    # results/logs_obstacles/2023-10-27_15-30-00_SAC
+    current_run_name = f"{timestamp}_SAC_run" # Added '_run' for clarity
+    model_dir = os.path.join(base_model_dir, current_run_name)
+    log_dir = os.path.join(base_log_dir, current_run_name)
+
+    # Create the timestamped directories if they don't exist
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
+    print(f"Results for this run will be saved in: {model_dir} and {log_dir}")
 
     # Create and wrap the environment for training
     NUM_ENVS = 4
     # Don't add Monitor wrapper here since VecMonitor will handle monitoring
     env = DummyVecEnv([make_env(rank=i, obstacles=True, monitor=False) for i in range(NUM_ENVS)])
-    env = VecMonitor(env, log_dir)  # VecMonitor will handle logging
+    # VecMonitor will now log to the timestamped log_dir
+    env = VecMonitor(env, log_dir) 
 
     # Initialize the SAC agent
     model = SAC(
         "MlpPolicy",
         env,
         learning_rate=3e-4,
-        buffer_size=200000,  # Increased buffer size
+        buffer_size=200000,
         batch_size=256,
         tau=0.005,
         gamma=0.99,
         train_freq=1,
         gradient_steps=4,
-        learning_starts=5000,
+        learning_starts=10000,
         verbose=1,
-        ent_coef=0.01, 
+        ent_coef='auto', 
         policy_kwargs=dict(net_arch=[256, 256]),
-        tensorboard_log=log_dir
+        # Tensorboard logs will also go to the timestamped log_dir
+        tensorboard_log=log_dir 
     )
 
     # Set up callbacks
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,
-        save_path=model_dir,
+        # Checkpoints will be saved in the timestamped model_dir
+        save_path=model_dir, 
         name_prefix="sac_model"
     )
     
     # Create a separate environment for evaluation (no Monitor wrapping)
     eval_env = DummyVecEnv([make_env(rank=0, obstacles=True, monitor=False)])
-    eval_env = VecMonitor(eval_env, log_dir)
+    # Eval logs will also go to the timestamped log_dir
+    eval_env = VecMonitor(eval_env, log_dir) 
 
     # Stop if eval reward > threshold
     stop_callback = StopTrainingOnRewardThreshold(
-        reward_threshold=20,
+        reward_threshold=150,
         verbose=1
     )
 
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path=model_dir,
-        log_path=log_dir,
+        # Best model will be saved in the timestamped model_dir
+        best_model_save_path=model_dir, 
+        # Eval results log will also go to the timestamped log_dir
+        log_path=log_dir, 
         eval_freq=5000,
         deterministic=True,
         render=False,
@@ -99,27 +108,37 @@ def main():
     
     try:
         model.learn(
-            total_timesteps=1_000_000,
+            total_timesteps=5_000_000,
             callback=[checkpoint_callback, eval_callback]
         )
+        # Final model will be saved in the timestamped model_dir
         model.save(os.path.join(model_dir,"final_sac_model"))
         print("Training completed successfully.")
     except Exception as e:
         print(f"Training interrupted: {e}")
-        # Save current model
+        # Save current model in the timestamped model_dir
         model.save(os.path.join(model_dir,"interrupted_sac_model"))
         print("Model saved despite interruption.")
+    
+    # Return the timestamped model_dir and log_dir for evaluation
+    return model_dir, log_dir
 
 
-def evaluate_model(model_path, num_episodes=5):
+def evaluate_model(model_path, num_episodes=5, results_save_path=None):
     """
     Evaluate a trained model and log detailed step-by-step data.
+    
+    Args:
+        model_path (str): Path to the trained model (.zip file).
+        num_episodes (int): Number of episodes to run for evaluation.
+        results_save_path (str, optional): Directory to save evaluation logs and plots.
+                                           If None, a new timestamped directory will be created.
     """
     # Load the trained model
     model = SAC.load(model_path)
     
     # Create a new environment for evaluation WITH GUI and OBSTACLES
-    env = DroneNavigationEnv(gui=True, obstacles=True, initial_xyzs=np.array([[0., 0., 1.]]))
+    env = DroneNavigationEnv(gui=False, obstacles=True, initial_xyzs=np.array([[0., 0., 1.]]))
     env = TimeLimit(env, max_episode_steps=500)
     
     all_episode_data = []
@@ -164,10 +183,17 @@ def evaluate_model(model_path, num_episodes=5):
 
     env.close()
     
+    # Determine the save path for evaluation results
+    if results_save_path is None:
+        # If no specific path is provided, create a new timestamped dir for evaluation
+        eval_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        results_save_path = os.path.join("results/evaluation_logs", f"eval_{eval_timestamp}")
+    
+    os.makedirs(results_save_path, exist_ok=True) # Ensure the directory exists
+
     # Save detailed logs to a CSV file
     df = pd.DataFrame(all_episode_data)
-    log_file_path = os.path.join("results/evaluation_logs", "detailed_evaluation_log.csv")
-    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+    log_file_path = os.path.join(results_save_path, "detailed_evaluation_log.csv")
     df.to_csv(log_file_path, index=False)
     print(f"Detailed evaluation logs saved to: {log_file_path}")
 
@@ -187,25 +213,28 @@ def evaluate_model(model_path, num_episodes=5):
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.axis('equal')
-        plot_path = os.path.join("results/evaluation_logs", "episode_1_trajectory.png")
+        plot_path = os.path.join(results_save_path, "episode_1_trajectory.png")
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.show()
         print(f"Trajectory plot saved to: {plot_path}")
 
 
 if __name__ == "__main__":
-    main()
+    # Run training and get the timestamped directories
+    trained_model_dir, trained_log_dir = main()
     
     # After training, evaluate the final model
-    final_model_path = "models/sac_baseline_obstacles/final_sac_model.zip"
-    best_model_path = "models/sac_baseline_obstacles/best_model.zip"
+    final_model_path = os.path.join(trained_model_dir, "final_sac_model.zip")
+    best_model_path = os.path.join(trained_model_dir, "best_model.zip") # This is typically generated by EvalCallback
     
-    # Try to find the best available model
+    # Try to find the best available model within the current training run's directory
     if os.path.exists(best_model_path):
         print("Found best model, evaluating...")
-        evaluate_model(best_model_path, num_episodes=3)
+        # Pass the training run's log directory for evaluation results
+        evaluate_model(best_model_path, num_episodes=3, results_save_path=trained_log_dir)
     elif os.path.exists(final_model_path):
         print("Found final model, evaluating...")
-        evaluate_model(final_model_path, num_episodes=3)
+        # Pass the training run's log directory for evaluation results
+        evaluate_model(final_model_path, num_episodes=3, results_save_path=trained_log_dir)
     else:
-        print("No trained model found. Please check training logs.")
+        print("No trained model found. Please check training logs.") 
