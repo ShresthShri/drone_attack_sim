@@ -1,240 +1,300 @@
 import os
 import numpy as np
+import gymnasium as gym
 from stable_baselines3 import SAC
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, StopTrainingOnRewardThreshold
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold, BaseCallback
 from stable_baselines3.common.monitor import Monitor
-from gymnasium.wrappers import TimeLimit
-import pandas as pd
-import matplotlib.pyplot as plt
-import time
-from datetime import datetime # Import datetime for timestamping
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+import torch
+from tqdm import tqdm
 
 from envs.drone_navigation_env import DroneNavigationEnv
 
-def make_env(rank=0, seed=0, gui=False, max_steps=300, obstacles=True, monitor=True):
-    def _init():
-        env = DroneNavigationEnv(gui=gui, obstacles=obstacles)
-        env = TimeLimit(env, max_episode_steps=max_steps)
-        if monitor:
-            env = Monitor(env) 
-        env.reset(seed=seed + rank)
-        return env
-    return _init
 
-
-def main():
-    # Generate a timestamp for the current run
-    # Format: YYYY-MM-DD_HH-MM-SS (e.g., 2023-10-27_15-30-00)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+class ProgressBarCallback(BaseCallback):
+    """Custom callback that displays a progress bar during training."""
     
-    # Define base directories for models and logs
-    base_model_dir = "models/sac_baseline_obstacles"
-    base_log_dir = "results/logs_obstacles"
+    def __init__(self, total_timesteps, verbose=0):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+        self.pbar = None
+        
+    def _on_training_start(self) -> None:
+        """Initialize progress bar when training starts."""
+        self.pbar = tqdm(
+            total=self.total_timesteps,
+            desc="Training SAC",
+            unit="steps",
+            dynamic_ncols=True,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
+        )
+        
+    def _on_step(self) -> bool:
+        """Update progress bar on each step."""
+        if self.pbar is not None:
+            # Update progress bar
+            self.pbar.update(1)
+            
+            # Update postfix with current metrics if available
+            if hasattr(self.model, 'logger') and self.model.logger.name_to_value:
+                postfix_dict = {}
+                if 'rollout/ep_rew_mean' in self.model.logger.name_to_value:
+                    postfix_dict['reward'] = f"{self.model.logger.name_to_value['rollout/ep_rew_mean']:.2f}"
+                if 'rollout/ep_len_mean' in self.model.logger.name_to_value:
+                    postfix_dict['ep_len'] = f"{self.model.logger.name_to_value['rollout/ep_len_mean']:.0f}"
+                if 'train/learning_rate' in self.model.logger.name_to_value:
+                    postfix_dict['lr'] = f"{self.model.logger.name_to_value['train/learning_rate']:.2e}"
+                    
+                if postfix_dict:
+                    self.pbar.set_postfix(postfix_dict)
+        
+        return True
+    
+    def _on_training_end(self) -> None:
+        """Close progress bar when training ends."""
+        if self.pbar is not None:
+            self.pbar.close()
 
-    # Create a unique directory name for this run using the timestamp
-    # This will result in directories like:
-    # models/sac_baseline_obstacles/2023-10-27_15-30-00_SAC
-    # results/logs_obstacles/2023-10-27_15-30-00_SAC
-    current_run_name = f"{timestamp}_SAC_run" # Added '_run' for clarity
-    model_dir = os.path.join(base_model_dir, current_run_name)
-    log_dir = os.path.join(base_log_dir, current_run_name)
 
-    # Create the timestamped directories if they don't exist
-    os.makedirs(model_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    print(f"Results for this run will be saved in: {model_dir} and {log_dir}")
+class TrainingCallback:
+    """Custom callback for monitoring training progress."""
+    
+    def __init__(self, eval_freq=1000, save_freq=5000, save_path="./models/"):
+        self.eval_freq = eval_freq
+        self.save_freq = save_freq
+        self.save_path = save_path
+        os.makedirs(save_path, exist_ok=True)
+        
+    def setup_callbacks(self, eval_env, total_timesteps):
+        """Setup evaluation, checkpoint, and progress bar callbacks."""
+        # Progress bar callback
+        progress_callback = ProgressBarCallback(total_timesteps)
+        
+        # Stop training when reward threshold is reached
+        reward_threshold_callback = StopTrainingOnRewardThreshold(
+            reward_threshold=80.0,  # Adjust based on your reward scale
+            verbose=1
+        )
+        
+        # Evaluation callback
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=self.save_path,
+            log_path=self.save_path,
+            eval_freq=self.eval_freq,
+            deterministic=True,
+            render=False,
+            callback_on_new_best=reward_threshold_callback,
+            verbose=1
+        )
+        
+        return [progress_callback, eval_callback]
 
-    # Create and wrap the environment for training
-    NUM_ENVS = 4
-    # Don't add Monitor wrapper here since VecMonitor will handle monitoring
-    env = DummyVecEnv([make_env(rank=i, obstacles=True, monitor=False) for i in range(NUM_ENVS)])
-    # VecMonitor will now log to the timestamped log_dir
-    env = VecMonitor(env, log_dir) 
 
-    # Initialize the SAC agent
+def create_env(gui=False, record=False):
+    """Create the drone navigation environment."""
+    return DroneNavigationEnv(
+        gui=gui,
+        record=record,
+        pyb_freq=240,  # Fixed frequency to avoid issues
+        ctrl_freq=30   # Lower control frequency for stability
+    )
+
+
+def train_sac_drone():
+    """Train SAC agent for drone navigation."""
+    
+    # Training parameters
+    total_timesteps = 500000
+    learning_rate = 3e-4
+    buffer_size = 100000
+    batch_size = 256
+    tau = 0.005
+    gamma = 0.99
+    train_freq = 1
+    gradient_steps = 1
+    
+    # Create training environment
+    print("Creating training environment...")
+    train_env = make_vec_env(
+        lambda: Monitor(create_env(gui=False, record=False)),
+        n_envs=1,
+        vec_env_cls=DummyVecEnv
+    )
+    
+    # Normalize observations and rewards
+    train_env = VecNormalize(
+        train_env,
+        norm_obs=True,
+        norm_reward=True,
+        clip_obs=10.0
+    )
+    
+    # Create evaluation environment
+    print("Creating evaluation environment...")
+    eval_env = make_vec_env(
+        lambda: Monitor(create_env(gui=False, record=False)),
+        n_envs=1,
+        vec_env_cls=DummyVecEnv
+    )
+    eval_env = VecNormalize(
+        eval_env,
+        norm_obs=True,
+        norm_reward=False,  # Don't normalize rewards for evaluation
+        clip_obs=10.0,
+        training=False
+    )
+    
+    # Setup callbacks
+    callback_manager = TrainingCallback(
+        eval_freq=2000,
+        save_freq=10000,
+        save_path="./models/"
+    )
+    callbacks = callback_manager.setup_callbacks(eval_env, total_timesteps)
+    
+    # Create SAC model
+    print("Creating SAC model...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     model = SAC(
         "MlpPolicy",
-        env,
-        learning_rate=3e-4,
-        buffer_size=200000,
-        batch_size=256,
-        tau=0.005,
-        gamma=0.99,
-        train_freq=1,
-        gradient_steps=4,
-        learning_starts=10000,
+        train_env,
+        learning_rate=learning_rate,
+        buffer_size=buffer_size,
+        batch_size=batch_size,
+        tau=tau,
+        gamma=gamma,
+        train_freq=train_freq,
+        gradient_steps=gradient_steps,
+        learning_starts=1000,
+        policy_kwargs=dict(
+            net_arch=[256, 256],
+            activation_fn=torch.nn.ReLU
+        ),
         verbose=1,
-        ent_coef='auto', 
-        policy_kwargs=dict(net_arch=[256, 256]),
-        # Tensorboard logs will also go to the timestamped log_dir
-        tensorboard_log=log_dir 
-    )
-
-    # Set up callbacks
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10000,
-        # Checkpoints will be saved in the timestamped model_dir
-        save_path=model_dir, 
-        name_prefix="sac_model"
+        tensorboard_log="./tensorboard_logs/",
+        device=device
     )
     
-    # Create a separate environment for evaluation (no Monitor wrapping)
-    eval_env = DummyVecEnv([make_env(rank=0, obstacles=True, monitor=False)])
-    # Eval logs will also go to the timestamped log_dir
-    eval_env = VecMonitor(eval_env, log_dir) 
-
-    # Stop if eval reward > threshold
-    stop_callback = StopTrainingOnRewardThreshold(
-        reward_threshold=150,
-        verbose=1
-    )
-
-    eval_callback = EvalCallback(
-        eval_env,
-        # Best model will be saved in the timestamped model_dir
-        best_model_save_path=model_dir, 
-        # Eval results log will also go to the timestamped log_dir
-        log_path=log_dir, 
-        eval_freq=5000,
-        deterministic=True,
-        render=False,
-        callback_after_eval=stop_callback
-    )
-
-    # Start training
-    print("Training SAC agent (parallel, headless)..")
-    print(f"Tensorboard log: tensorboard --logdir {log_dir}")
+    print("Starting training...")
+    print(f"Total timesteps: {total_timesteps}")
+    print(f"Device: {device}")
+    print(f"Observation space: {train_env.observation_space}")
+    print(f"Action space: {train_env.action_space}")
     
+    # Train the model
     try:
         model.learn(
-            total_timesteps=5_000_000,
-            callback=[checkpoint_callback, eval_callback]
+            total_timesteps=total_timesteps,
+            callback=callbacks,
+            log_interval=10,
+            tb_log_name="SAC_DroneNavigation"
         )
-        # Final model will be saved in the timestamped model_dir
-        model.save(os.path.join(model_dir,"final_sac_model"))
-        print("Training completed successfully.")
-    except Exception as e:
-        print(f"Training interrupted: {e}")
-        # Save current model in the timestamped model_dir
-        model.save(os.path.join(model_dir,"interrupted_sac_model"))
-        print("Model saved despite interruption.")
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.")
+        # Close progress bar if interrupted
+        for callback in callbacks:
+            if isinstance(callback, ProgressBarCallback):
+                callback._on_training_end()
     
-    # Return the timestamped model_dir and log_dir for evaluation
-    return model_dir, log_dir
+    # Save final model
+    print("Saving final model...")
+    model.save("./models/sac_drone_navigation_final")
+    train_env.save("./models/vec_normalize.pkl")
+    
+    print("Training completed!")
+    return model, train_env
 
 
-def evaluate_model(model_path, num_episodes=5, results_save_path=None):
-    """
-    Evaluate a trained model and log detailed step-by-step data.
+def test_trained_model(model_path="./models/best_model.zip", 
+                      norm_path="./models/vec_normalize.pkl",
+                      episodes=5):
+    """Test the trained model."""
     
-    Args:
-        model_path (str): Path to the trained model (.zip file).
-        num_episodes (int): Number of episodes to run for evaluation.
-        results_save_path (str, optional): Directory to save evaluation logs and plots.
-                                           If None, a new timestamped directory will be created.
-    """
-    # Load the trained model
-    model = SAC.load(model_path)
+    print(f"Loading model from {model_path}...")
     
-    # Create a new environment for evaluation WITH GUI and OBSTACLES
-    env = DroneNavigationEnv(gui=False, obstacles=True, initial_xyzs=np.array([[0., 0., 1.]]))
-    env = TimeLimit(env, max_episode_steps=500)
+    # Create test environment
+    test_env = create_env(gui=False, record=False)
+    test_env = Monitor(test_env)
+    test_env = DummyVecEnv([lambda: test_env])
     
-    all_episode_data = []
-
-    print(f"\nEvaluating model: {model_path} for {num_episodes} episodes (with GUI)...")
-    for episode in range(num_episodes):
-        obs, info = env.reset()
+    # Load normalization parameters
+    if os.path.exists(norm_path):
+        test_env = VecNormalize.load(norm_path, test_env)
+        test_env.training = False
+        test_env.norm_reward = False
+    
+    # Load model
+    model = SAC.load(model_path, env=test_env)
+    
+    # Test episodes
+    total_rewards = []
+    success_count = 0
+    
+    for episode in range(episodes):
+        obs = test_env.reset()
         episode_reward = 0
         done = False
         step_count = 0
         
-        episode_data = []
+        print(f"\nEpisode {episode + 1}/{episodes}")
         
-        while not done:
+        while not done and step_count < 1000:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            episode_reward += reward
+            obs, reward, done, info = test_env.step(action)
+            episode_reward += reward[0]
             step_count += 1
             
-            # Collect detailed step-by-step data
-            step_info = {
-                "episode": episode + 1,
-                "step": step_count,
-                "drone_x": info["drone_position"][0],
-                "drone_y": info["drone_position"][1],
-                "drone_z": info["drone_position"][2],
-                "goal_x": info["goal_position"][0],
-                "goal_y": info["goal_position"][1],
-                "goal_z": info["goal_position"][2],
-                "reward": info["true_reward"],
-                "collision_occurred": info["collision_occurred"],
-                "reached_goal": info["reached_goal"],
-            }
-            episode_data.append(step_info)
-            
-            # Small delay for visualization
-            time.sleep(0.02)
-            
-        print(f"Episode {episode + 1} finished. Total reward: {episode_reward:.2f}, Steps: {step_count}")
-        all_episode_data.extend(episode_data)
-
-    env.close()
+            if info[0].get('success', False):
+                success_count += 1
+                print(f"Success! Reached target in {step_count} steps")
+                break
+                
+        total_rewards.append(episode_reward)
+        print(f"Episode reward: {episode_reward:.2f}")
+        print(f"Distance to target: {info[0].get('distance_to_target', 'N/A'):.3f}")
     
-    # Determine the save path for evaluation results
-    if results_save_path is None:
-        # If no specific path is provided, create a new timestamped dir for evaluation
-        eval_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        results_save_path = os.path.join("results/evaluation_logs", f"eval_{eval_timestamp}")
+    print(f"\nTest Results:")
+    print(f"Average reward: {np.mean(total_rewards):.2f} ± {np.std(total_rewards):.2f}")
+    print(f"Success rate: {success_count}/{episodes} ({success_count/episodes*100:.1f}%)")
     
-    os.makedirs(results_save_path, exist_ok=True) # Ensure the directory exists
+    test_env.close()
 
-    # Save detailed logs to a CSV file
-    df = pd.DataFrame(all_episode_data)
-    log_file_path = os.path.join(results_save_path, "detailed_evaluation_log.csv")
-    df.to_csv(log_file_path, index=False)
-    print(f"Detailed evaluation logs saved to: {log_file_path}")
 
-    # Plot trajectory for first episode
-    if num_episodes > 0:
-        first_episode_df = df[df['episode'] == 1]
-        plt.figure(figsize=(8, 6))
-        plt.plot(first_episode_df['drone_x'], first_episode_df['drone_y'], 
-                label='Drone Trajectory', linewidth=2)
-        plt.scatter(first_episode_df['goal_x'].iloc[0], first_episode_df['goal_y'].iloc[0], 
-                   color='red', marker='*', s=200, label='Goal')
-        plt.scatter(first_episode_df['drone_x'].iloc[0], first_episode_df['drone_y'].iloc[0], 
-                   color='green', marker='o', s=100, label='Start')
-        plt.title('Drone Trajectory (Episode 1)')
-        plt.xlabel('X Position')
-        plt.ylabel('Y Position')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.axis('equal')
-        plot_path = os.path.join(results_save_path, "episode_1_trajectory.png")
-        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-        plt.show()
-        print(f"Trajectory plot saved to: {plot_path}")
+def main():
+    """Main training function."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train SAC agent for drone navigation')
+    parser.add_argument('--mode', choices=['train', 'test'], default='train',
+                       help='Mode: train or test')
+    parser.add_argument('--model_path', type=str, default='./models/best_model.zip',
+                       help='Path to saved model for testing')
+    parser.add_argument('--episodes', type=int, default=5,
+                       help='Number of test episodes')
+    
+    args = parser.parse_args()
+    
+    if args.mode == 'train':
+        model, env = train_sac_drone()
+        
+        # Test the trained model
+        print("\nTesting trained model...")
+        test_trained_model(episodes=3)
+        
+    elif args.mode == 'test':
+        if not os.path.exists(args.model_path):
+            print(f"Model file {args.model_path} not found!")
+            return
+        
+        test_trained_model(
+            model_path=args.model_path,
+            episodes=args.episodes
+        )
 
 
 if __name__ == "__main__":
-    # Run training and get the timestamped directories
-    trained_model_dir, trained_log_dir = main()
-    
-    # After training, evaluate the final model
-    final_model_path = os.path.join(trained_model_dir, "final_sac_model.zip")
-    best_model_path = os.path.join(trained_model_dir, "best_model.zip") # This is typically generated by EvalCallback
-    
-    # Try to find the best available model within the current training run's directory
-    if os.path.exists(best_model_path):
-        print("Found best model, evaluating...")
-        # Pass the training run's log directory for evaluation results
-        evaluate_model(best_model_path, num_episodes=3, results_save_path=trained_log_dir)
-    elif os.path.exists(final_model_path):
-        print("Found final model, evaluating...")
-        # Pass the training run's log directory for evaluation results
-        evaluate_model(final_model_path, num_episodes=3, results_save_path=trained_log_dir)
-    else:
-        print("No trained model found. Please check training logs.") 
+    main()
