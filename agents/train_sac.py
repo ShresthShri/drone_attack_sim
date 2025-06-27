@@ -13,8 +13,7 @@ from envs.drone_navigation_env import DroneNavigationEnv
 
 
 class ProgressBarCallback(BaseCallback):
-    """Custom callback that displays a progress bar during training."""
-    
+    """Custom callback to display a progress bar during training."""    
     def __init__(self, total_timesteps, verbose=0):
         super().__init__(verbose)
         self.total_timesteps = total_timesteps
