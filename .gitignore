@@ -43,3 +43,26 @@ models/
 
 # Misc
 .DS_Store
+
+# Add these to your existing .gitignore
+cat >> .gitignore << 'EOF'
+
+# Downloaded installation files
+virtualenv-*/
+get-pip.py
+installed_packages.txt
+
+# Large training artifacts
+tensorboard_logs/
+sac_drone_logs/
+evaluation_results/
+evaluation_plots/
+
+# PyBullet recordings and data
+*.mp4
+*.avi
+recordings/
+
+# Temporary files from quota issues
+temp_*/
+EOF
