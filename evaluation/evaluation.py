@@ -1,524 +1,593 @@
+#!/usr/bin/env python3
+"""
+Evaluate trained progressive difficulty drone navigation model and create visualizations
+"""
+
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import os
+import seaborn as sns
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
 import json
 from datetime import datetime
-from stable_baselines3 import SAC
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.monitor import Monitor
-from envs.drone_navigation_env import DroneNavigationEnv
+import pandas as pd
 
-# Set matplotlib backend for headless environments
-plt.switch_backend('Agg')
+# Import your environment - adjust import path as needed
+from agents.train_sac import ProgressiveObstacleNavigationEnv, make_progressive_env
 
-class DroneEvaluator:
-    """
-    Lean and clear evaluation system for drone navigation with trajectory plotting.
-    """
+
+def load_trained_model(model_path, normalize_path=None):
+    """Load the trained model and normalization."""
+    print(f"📂 Loading model from: {model_path}")
     
-    def __init__(self, model_path, normalization_path=None, output_dir="./evaluation_results"):
-        """
-        Initialize the evaluator.
-        
-        Args:
-            model_path (str): Path to the trained SAC model
-            normalization_path (str): Path to VecNormalize parameters
-            output_dir (str): Directory to save evaluation results
-        """
-        self.model_path = model_path
-        self.normalization_path = normalization_path
-        self.output_dir = output_dir
-        self.model = None
-        self.env = None
-        
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Results storage
-        self.evaluation_results = {
-            'episodes': [],
-            'trajectories': [],
-            'statistics': {},
-            'metadata': {
-                'model_path': model_path,
-                'evaluation_date': datetime.now().isoformat(),
-                'normalization_used': normalization_path is not None
-            }
-        }
+    # Load model
+    model = SAC.load(model_path)
     
-    def load_model_and_env(self):
-        """Load the trained model and setup evaluation environment."""
-        print("🔄 Loading model and environment...")
-        
-        # Create environment
-        env = DroneNavigationEnv(gui=False, record=False)
-        env = Monitor(env)
-        env = DummyVecEnv([lambda: env])
-        
-        # Load normalization if available
-        if self.normalization_path and os.path.exists(self.normalization_path):
-            print(f"📊 Loading normalization from: {self.normalization_path}")
-            env = VecNormalize.load(self.normalization_path, env)
-            env.training = False
-            env.norm_reward = False
-        
-        # Load model
-        print(f"🤖 Loading model from: {self.model_path}")
-        model = SAC.load(self.model_path, env=env)
-        
-        self.model = model
-        self.env = env
-        print("✅ Model and environment loaded successfully!")
+    # Load normalization if available
+    if normalize_path and os.path.exists(normalize_path):
+        print(f"📂 Loading normalization from: {normalize_path}")
+        # Create dummy env for normalization structure
+        dummy_env = DummyVecEnv([make_progressive_env(gui=False)])
+        normalize = VecNormalize.load(normalize_path, dummy_env)
+        normalize.training = False
+        normalize.norm_reward = False
+        return model, normalize
+    else:
+        print("⚠️ No normalization file found, using raw environment")
+        return model, None
+
+
+def evaluate_model_at_difficulty(model, env, difficulty_level, n_episodes=5, render=False, record_trajectories=True):
+    """Evaluate the model at a specific difficulty level."""
+    print(f"🎯 Evaluating at difficulty level {difficulty_level} over {n_episodes} episodes...")
     
-    def run_evaluation(self, n_episodes=10, max_steps=1000, deterministic=True):
-        """
-        Run evaluation episodes and collect trajectory data.
-        
-        Args:
-            n_episodes (int): Number of episodes to evaluate
-            max_steps (int): Maximum steps per episode
-            deterministic (bool): Use deterministic policy
-        """
-        if self.model is None or self.env is None:
-            self.load_model_and_env()
-        
-        print(f"🎯 Running evaluation for {n_episodes} episodes...")
-        
-        for episode in range(n_episodes):
-            episode_data = self._run_single_episode(episode, max_steps, deterministic)
-            self.evaluation_results['episodes'].append(episode_data)
-            self.evaluation_results['trajectories'].append(episode_data['trajectory'])
-            
-            # Print episode summary
-            success_status = "✅ SUCCESS" if episode_data['success'] else "❌ FAILED"
-            print(f"Episode {episode+1:2d}: {success_status} | "
-                  f"Reward: {episode_data['total_reward']:6.1f} | "
-                  f"Steps: {episode_data['steps']:3d} | "
-                  f"Final Distance: {episode_data['final_distance']:.3f}")
-        
-        # Calculate statistics
-        self._calculate_statistics()
-        print(f"\n📈 Evaluation completed! Results saved to: {self.output_dir}")
+    # Set difficulty level for all environments
+    if hasattr(env, 'envs'):
+        for env_instance in env.envs:
+            if hasattr(env_instance.env, 'difficulty_level'):
+                env_instance.env.difficulty_level = difficulty_level
+    elif hasattr(env.env, 'difficulty_level'):
+        env.env.difficulty_level = difficulty_level
     
-    def _run_single_episode(self, episode_idx, max_steps, deterministic):
-        """Run a single evaluation episode and collect data."""
-        obs = self.env.reset()
-        
-        # Initialize episode data
-        episode_data = {
-            'episode': episode_idx,
-            'trajectory': {'x': [], 'y': [], 'z': []},
-            'actions': [],
-            'rewards': [],
-            'distances': [],
-            'timestamps': [],
-            'target_position': None,
-            'start_position': None,
-            'success': False,
-            'total_reward': 0.0,
-            'steps': 0,
-            'final_distance': float('inf')
-        }
-        
-        step = 0
+    # Statistics tracking
+    episode_rewards = []
+    episode_lengths = []
+    success_count = 0
+    collision_count = 0
+    timeout_count = 0
+    final_distances = []
+    efficiency_scores = []
+    
+    # Trajectory tracking
+    trajectories = []
+    obstacle_data = []
+    
+    for episode in range(n_episodes):
+        obs = env.reset()
+        episode_reward = 0.0
+        episode_length = 0
         done = False
         
-        while not done and step < max_steps:
-            # Get action from model
-            action, _ = self.model.predict(obs, deterministic=deterministic)
-            
-            # Execute action
-            obs, reward, done, info = self.env.step(action)
-            
-            # Extract environment info
-            env_info = info[0] if isinstance(info, list) else info
-            current_pos = env_info.get('current_position', [0, 0, 0])
-            target_pos = env_info.get('target_position', [0, 0, 0])
-            distance = env_info.get('distance_to_target', 0)
-            
-            # Store trajectory data
-            episode_data['trajectory']['x'].append(current_pos[0])
-            episode_data['trajectory']['y'].append(current_pos[1])
-            episode_data['trajectory']['z'].append(current_pos[2])
-            episode_data['actions'].append(action[0].tolist() if hasattr(action[0], 'tolist') else action[0])
-            episode_data['rewards'].append(reward[0] if isinstance(reward, np.ndarray) else reward)
-            episode_data['distances'].append(distance)
-            episode_data['timestamps'].append(step)
-            
-            # Store initial positions
-            if step == 0:
-                episode_data['start_position'] = current_pos.copy()
-                episode_data['target_position'] = target_pos.copy()
-            
-            episode_data['total_reward'] += reward[0] if isinstance(reward, np.ndarray) else reward
-            step += 1
-        
-        # Final episode statistics
-        episode_data['steps'] = step
-        episode_data['success'] = env_info.get('success', False)
-        episode_data['final_distance'] = episode_data['distances'][-1] if episode_data['distances'] else float('inf')
-        
-        return episode_data
-    
-    def _calculate_statistics(self):
-        """Calculate evaluation statistics."""
-        episodes = self.evaluation_results['episodes']
-        
-        rewards = [ep['total_reward'] for ep in episodes]
-        steps = [ep['steps'] for ep in episodes]
-        distances = [ep['final_distance'] for ep in episodes]
-        successes = [ep['success'] for ep in episodes]
-        
-        stats = {
-            'n_episodes': len(episodes),
-            'success_rate': np.mean(successes) * 100,
-            'reward_mean': np.mean(rewards),
-            'reward_std': np.std(rewards),
-            'reward_min': np.min(rewards),
-            'reward_max': np.max(rewards),
-            'steps_mean': np.mean(steps),
-            'steps_std': np.std(steps),
-            'steps_min': np.min(steps),
-            'steps_max': np.max(steps),
-            'final_distance_mean': np.mean(distances),
-            'final_distance_std': np.std(distances),
-            'final_distance_min': np.min(distances),
-            'final_distance_max': np.max(distances)
-        }
-        
-        self.evaluation_results['statistics'] = stats
-    
-    def plot_trajectories_2d(self, save_individual=True, save_combined=True):
-        """
-        Create 2D trajectory plots.
-        
-        Args:
-            save_individual (bool): Save individual episode plots
-            save_combined (bool): Save combined trajectory plot
-        """
-        trajectories = self.evaluation_results['trajectories']
-        episodes = self.evaluation_results['episodes']
-        
-        if save_combined:
-            self._plot_combined_trajectories_2d(trajectories, episodes)
-        
-        if save_individual:
-            self._plot_individual_trajectories_2d(trajectories, episodes)
-    
-    def _plot_combined_trajectories_2d(self, trajectories, episodes):
-        """Plot all trajectories on a single 2D plot."""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-        
-        # X-Y plane plot
-        successful_count = 0
-        failed_count = 0
-        
-        for i, (traj, episode) in enumerate(zip(trajectories, episodes)):
-            if episode['success']:
-                color = 'green'
-                alpha = 0.7
-                label = 'Successful' if successful_count == 0 else ""
-                successful_count += 1
+        # Track trajectory for this episode
+        if record_trajectories:
+            trajectory = []
+            # Get environment instance
+            if hasattr(env, 'envs'):
+                env_instance = env.envs[0].env
             else:
-                color = 'red'
-                alpha = 0.5
-                label = 'Failed' if failed_count == 0 else ""
-                failed_count += 1
+                env_instance = env.env if hasattr(env, 'env') else env
             
-            ax1.plot(traj['x'], traj['y'], color=color, alpha=alpha, linewidth=2, label=label)
-            
-            # Mark start and end points
-            ax1.plot(traj['x'][0], traj['y'][0], 'bo', markersize=8, alpha=0.7)  # Start (blue)
-            ax1.plot(traj['x'][-1], traj['y'][-1], 'ro', markersize=8, alpha=0.7)  # End (red)
-            
-            # Mark target
-            if episode['target_position'] is not None:
-                target = episode['target_position']
-                ax1.plot(target[0], target[1], 'g*', markersize=15, alpha=0.8)
+            current_obstacles = []
+            if hasattr(env_instance, 'obstacles'):
+                current_obstacles = [(obs['position'], obs['size']) for obs in env_instance.obstacles]
         
-        ax1.set_xlabel('X Position (m)')
-        ax1.set_ylabel('Y Position (m)')
-        ax1.set_title('2D Trajectories (X-Y Plane)')
-        ax1.grid(True, alpha=0.3)
-        ax1.legend()
-        ax1.axis('equal')
-        
-        # X-Z plane plot
-        for i, (traj, episode) in enumerate(zip(trajectories, episodes)):
-            color = 'green' if episode['success'] else 'red'
-            alpha = 0.7 if episode['success'] else 0.5
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)  # Use deterministic for evaluation
+            obs, reward, done, info = env.step(action)
             
-            ax2.plot(traj['x'], traj['z'], color=color, alpha=alpha, linewidth=2)
-            ax2.plot(traj['x'][0], traj['z'][0], 'bo', markersize=8, alpha=0.7)
-            ax2.plot(traj['x'][-1], traj['z'][-1], 'ro', markersize=8, alpha=0.7)
+            episode_reward += reward[0] if isinstance(reward, (list, np.ndarray)) else reward
+            episode_length += 1
             
-            # Mark target
-            if episode['target_position'] is not None:
-                target = episode['target_position']
-                ax2.plot(target[0], target[2], 'g*', markersize=15, alpha=0.8)
-        
-        ax2.set_xlabel('X Position (m)')
-        ax2.set_ylabel('Z Position (m)')
-        ax2.set_title('2D Trajectories (X-Z Plane)')
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'combined_trajectories_2d.png'), 
-                   dpi=150, bbox_inches='tight')
-        plt.close()
-        print("📊 Combined 2D trajectory plot saved!")
-    
-    def _plot_individual_trajectories_2d(self, trajectories, episodes):
-        """Plot individual trajectory plots."""
-        individual_dir = os.path.join(self.output_dir, 'individual_trajectories')
-        os.makedirs(individual_dir, exist_ok=True)
-        
-        for i, (traj, episode) in enumerate(zip(trajectories, episodes)):
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+            # Record trajectory
+            if record_trajectories and hasattr(env_instance, 'pos'):
+                current_pos = env_instance.pos[0].copy()
+                trajectory.append(current_pos)
             
-            # Determine colors based on success
-            traj_color = 'green' if episode['success'] else 'red'
-            title_status = "SUCCESS" if episode['success'] else "FAILED"
-            
-            # X-Y plot
-            ax1.plot(traj['x'], traj['y'], color=traj_color, linewidth=2, alpha=0.8)
-            ax1.plot(traj['x'][0], traj['y'][0], 'bo', markersize=10, label='Start')
-            ax1.plot(traj['x'][-1], traj['y'][-1], 'ro', markersize=10, label='End')
-            
-            if episode['target_position'] is not None:
-                target = episode['target_position']
-                ax1.plot(target[0], target[1], 'g*', markersize=20, label='Target')
-                
-                # Draw target tolerance circle
-                circle = patches.Circle((target[0], target[1]), 0.1, 
-                                      fill=False, color='green', linestyle='--', alpha=0.5)
-                ax1.add_patch(circle)
-            
-            ax1.set_xlabel('X Position (m)')
-            ax1.set_ylabel('Y Position (m)')
-            ax1.set_title(f'Episode {i+1} - {title_status} (X-Y)')
-            ax1.grid(True, alpha=0.3)
-            ax1.legend()
-            ax1.axis('equal')
-            
-            # X-Z plot
-            ax2.plot(traj['x'], traj['z'], color=traj_color, linewidth=2, alpha=0.8)
-            ax2.plot(traj['x'][0], traj['z'][0], 'bo', markersize=10, label='Start')
-            ax2.plot(traj['x'][-1], traj['z'][-1], 'ro', markersize=10, label='End')
-            
-            if episode['target_position'] is not None:
-                target = episode['target_position']
-                ax2.plot(target[0], target[2], 'g*', markersize=20, label='Target')
-            
-            ax2.set_xlabel('X Position (m)')
-            ax2.set_ylabel('Z Position (m)')
-            ax2.set_title(f'Episode {i+1} - {title_status} (X-Z)')
-            ax2.grid(True, alpha=0.3)
-            ax2.legend()
-            
-            # Add episode statistics as text
-            stats_text = (f'Reward: {episode["total_reward"]:.1f}\n'
-                         f'Steps: {episode["steps"]}\n'
-                         f'Final Dist: {episode["final_distance"]:.3f}m')
-            ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes, 
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(individual_dir, f'episode_{i+1:02d}_trajectory.png'), 
-                       dpi=150, bbox_inches='tight')
-            plt.close()
+            if render:
+                env.render()
         
-        print(f"📊 {len(trajectories)} individual trajectory plots saved!")
-    
-    def plot_performance_metrics(self):
-        """Plot performance metrics and statistics."""
-        episodes = self.evaluation_results['episodes']
-        stats = self.evaluation_results['statistics']
+        # Process episode results
+        final_info = info[0] if isinstance(info, list) else info
         
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
         
-        # Episode rewards
-        rewards = [ep['total_reward'] for ep in episodes]
-        colors = ['green' if ep['success'] else 'red' for ep in episodes]
-        
-        ax1.bar(range(1, len(rewards)+1), rewards, color=colors, alpha=0.7)
-        ax1.set_xlabel('Episode')
-        ax1.set_ylabel('Total Reward')
-        ax1.set_title('Episode Rewards')
-        ax1.grid(True, alpha=0.3)
-        
-        # Episode steps
-        steps = [ep['steps'] for ep in episodes]
-        ax2.bar(range(1, len(steps)+1), steps, color=colors, alpha=0.7)
-        ax2.set_xlabel('Episode')
-        ax2.set_ylabel('Steps')
-        ax2.set_title('Episode Duration (Steps)')
-        ax2.grid(True, alpha=0.3)
-        
-        # Final distances
-        distances = [ep['final_distance'] for ep in episodes]
-        ax3.bar(range(1, len(distances)+1), distances, color=colors, alpha=0.7)
-        ax3.axhline(y=0.1, color='green', linestyle='--', alpha=0.8, label='Success Threshold')
-        ax3.set_xlabel('Episode')
-        ax3.set_ylabel('Final Distance to Target (m)')
-        ax3.set_title('Final Distance to Target')
-        ax3.grid(True, alpha=0.3)
-        ax3.legend()
-        
-        # Statistics summary
-        ax4.axis('off')
-        stats_text = f"""
-Evaluation Summary:
-{'='*30}
-Episodes: {stats['n_episodes']}
-Success Rate: {stats['success_rate']:.1f}%
-
-Rewards:
-  Mean: {stats['reward_mean']:.2f} ± {stats['reward_std']:.2f}
-  Range: [{stats['reward_min']:.1f}, {stats['reward_max']:.1f}]
-
-Steps:
-  Mean: {stats['steps_mean']:.1f} ± {stats['steps_std']:.1f}
-  Range: [{stats['steps_min']}, {stats['steps_max']}]
-
-Final Distance:
-  Mean: {stats['final_distance_mean']:.3f} ± {stats['final_distance_std']:.3f}
-  Range: [{stats['final_distance_min']:.3f}, {stats['final_distance_max']:.3f}]
-        """
-        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=12,
-                verticalalignment='top', fontfamily='monospace',
-                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output_dir, 'performance_metrics.png'), 
-                   dpi=150, bbox_inches='tight')
-        plt.close()
-        print("📊 Performance metrics plot saved!")
-    
-    def save_results(self):
-        """Save evaluation results to JSON file."""
-        # Convert numpy arrays to lists for JSON serialization
-        json_results = {}
-        for key, value in self.evaluation_results.items():
-            if key == 'episodes':
-                json_results[key] = []
-                for episode in value:
-                    json_episode = {}
-                    for ep_key, ep_value in episode.items():
-                        if isinstance(ep_value, np.ndarray):
-                            json_episode[ep_key] = ep_value.tolist()
-                        elif isinstance(ep_value, dict):
-                            json_episode[ep_key] = {k: (v.tolist() if isinstance(v, np.ndarray) else v) 
-                                                  for k, v in ep_value.items()}
-                        else:
-                            json_episode[ep_key] = ep_value
-                    json_results[key].append(json_episode)
+        # Count termination reasons
+        if isinstance(final_info, dict):
+            success = final_info.get('success', False)
+            collision = final_info.get('collision', False)
+            distance = final_info.get('distance_to_goal', np.inf)
+            
+            if success:
+                success_count += 1
+                print(f"  Episode {episode+1}: ✅ SUCCESS (reward: {episode_reward:.1f}, length: {episode_length})")
+            elif collision:
+                collision_count += 1
+                print(f"  Episode {episode+1}: 💥 COLLISION (reward: {episode_reward:.1f}, length: {episode_length})")
             else:
-                json_results[key] = value
+                timeout_count += 1
+                print(f"  Episode {episode+1}: ⏰ TIMEOUT (reward: {episode_reward:.1f}, length: {episode_length})")
+            
+            final_distances.append(distance)
+            
+            # Calculate efficiency
+            if hasattr(env_instance, '_get_efficiency_metric'):
+                efficiency = env_instance._get_efficiency_metric()
+                efficiency_scores.append(efficiency)
+        else:
+            print(f"  Episode {episode+1}: COMPLETED (reward: {episode_reward:.1f}, length: {episode_length})")
         
-        results_path = os.path.join(self.output_dir, 'evaluation_results.json')
-        with open(results_path, 'w') as f:
-            json.dump(json_results, f, indent=2, default=str)
-        
-        print(f"💾 Evaluation results saved to: {results_path}")
+        # Store trajectory and obstacles
+        if record_trajectories:
+            trajectories.append(trajectory)
+            obstacle_data.append(current_obstacles)
     
-    def generate_report(self):
-        """Generate a comprehensive evaluation report."""
-        stats = self.evaluation_results['statistics']
+    # Calculate statistics
+    stats = {
+        'difficulty_level': difficulty_level,
+        'mean_reward': np.mean(episode_rewards),
+        'std_reward': np.std(episode_rewards),
+        'mean_length': np.mean(episode_lengths),
+        'std_length': np.std(episode_lengths),
+        'success_rate': success_count / n_episodes,
+        'collision_rate': collision_count / n_episodes,
+        'timeout_rate': timeout_count / n_episodes,
+        'mean_final_distance': np.mean(final_distances) if final_distances else np.inf,
+        'mean_efficiency': np.mean(efficiency_scores) if efficiency_scores else 0.0,
+        'episode_rewards': episode_rewards,
+        'episode_lengths': episode_lengths,
+        'final_distances': final_distances,
+        'efficiency_scores': efficiency_scores,
+        'trajectories': trajectories,
+        'obstacles': obstacle_data
+    }
+    
+    return stats
+
+
+def evaluate_all_difficulties(model, env, n_episodes_per_level=5, render=False):
+    """Evaluate model across all difficulty levels."""
+    print("🚀 Evaluating across all difficulty levels...")
+    
+    all_stats = {}
+    difficulty_levels = [0, 1, 2, 3]  # Based on your progressive environment
+    
+    for level in difficulty_levels:
+        print(f"\n{'='*50}")
+        print(f"🎯 DIFFICULTY LEVEL {level}")
+        level_names = {0: "Beginner (No obstacles)", 1: "Easy (2 obstacles)", 
+                      2: "Medium (4 obstacles)", 3: "Hard (6 obstacles)"}
+        print(f"   {level_names.get(level, f'Level {level}')}")
+        print(f"{'='*50}")
         
-        report_path = os.path.join(self.output_dir, 'evaluation_report.txt')
-        with open(report_path, 'w') as f:
-            f.write("🚁 DRONE NAVIGATION EVALUATION REPORT\n")
-            f.write("=" * 50 + "\n\n")
-            
-            f.write(f"📅 Evaluation Date: {self.evaluation_results['metadata']['evaluation_date']}\n")
-            f.write(f"🤖 Model Path: {self.evaluation_results['metadata']['model_path']}\n")
-            f.write(f"📊 Normalization Used: {self.evaluation_results['metadata']['normalization_used']}\n\n")
-            
-            f.write("📈 PERFORMANCE SUMMARY:\n")
-            f.write("-" * 30 + "\n")
-            f.write(f"Episodes Evaluated: {stats['n_episodes']}\n")
-            f.write(f"Success Rate: {stats['success_rate']:.1f}%\n")
-            f.write(f"Mean Reward: {stats['reward_mean']:.2f} ± {stats['reward_std']:.2f}\n")
-            f.write(f"Mean Steps: {stats['steps_mean']:.1f} ± {stats['steps_std']:.1f}\n")
-            f.write(f"Mean Final Distance: {stats['final_distance_mean']:.3f} ± {stats['final_distance_std']:.3f} m\n\n")
-            
-            f.write("🎯 DETAILED STATISTICS:\n")
-            f.write("-" * 30 + "\n")
-            f.write(f"Reward Range: [{stats['reward_min']:.1f}, {stats['reward_max']:.1f}]\n")
-            f.write(f"Steps Range: [{stats['steps_min']}, {stats['steps_max']}]\n")
-            f.write(f"Distance Range: [{stats['final_distance_min']:.3f}, {stats['final_distance_max']:.3f}] m\n\n")
-            
-            # Analysis
-            if stats['success_rate'] >= 80:
-                f.write("✅ EXCELLENT: High success rate achieved!\n")
-            elif stats['success_rate'] >= 60:
-                f.write("🟡 GOOD: Moderate success rate, room for improvement.\n")
-            else:
-                f.write("🔴 NEEDS IMPROVEMENT: Low success rate detected.\n")
-            
-            f.write(f"\n📊 Files Generated:\n")
-            f.write(f"- combined_trajectories_2d.png\n")
-            f.write(f"- performance_metrics.png\n")
-            f.write(f"- individual_trajectories/ (folder)\n")
-            f.write(f"- evaluation_results.json\n")
+        stats = evaluate_model_at_difficulty(
+            model, env, level, n_episodes_per_level, render, record_trajectories=True
+        )
+        all_stats[level] = stats
         
-        print(f"📋 Evaluation report saved to: {report_path}")
+        # Print level summary
+        print(f"\n📊 LEVEL {level} SUMMARY:")
+        print(f"   Success Rate: {stats['success_rate']:.1%}")
+        print(f"   Mean Reward: {stats['mean_reward']:.1f} ± {stats['std_reward']:.1f}")
+        print(f"   Mean Length: {stats['mean_length']:.1f} steps")
+        print(f"   Collision Rate: {stats['collision_rate']:.1%}")
+        if stats['efficiency_scores']:
+            print(f"   Mean Efficiency: {stats['mean_efficiency']:.3f}")
+    
+    return all_stats
+
+
+def plot_difficulty_comparison(all_stats, save_dir=None):
+    """Create comprehensive comparison plots across difficulty levels."""
+    
+    plt.style.use('default')
+    sns.set_palette("husl")
+    
+    # Extract data for plotting
+    levels = sorted(all_stats.keys())
+    success_rates = [all_stats[level]['success_rate'] for level in levels]
+    mean_rewards = [all_stats[level]['mean_reward'] for level in levels]
+    std_rewards = [all_stats[level]['std_reward'] for level in levels]
+    mean_lengths = [all_stats[level]['mean_length'] for level in levels]
+    collision_rates = [all_stats[level]['collision_rate'] for level in levels]
+    mean_efficiencies = [all_stats[level]['mean_efficiency'] for level in levels]
+    
+    # Create comprehensive figure
+    fig = plt.figure(figsize=(20, 15))
+    
+    # 1. Success Rate by Difficulty
+    plt.subplot(3, 4, 1)
+    bars = plt.bar(levels, success_rates, color=['green', 'lightgreen', 'orange', 'red'], alpha=0.7)
+    plt.xlabel('Difficulty Level')
+    plt.ylabel('Success Rate')
+    plt.title('Success Rate by Difficulty Level')
+    plt.ylim(0, 1.1)
+    for i, bar in enumerate(bars):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                f'{success_rates[i]:.1%}', ha='center', va='bottom', fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    
+    # 2. Mean Reward by Difficulty
+    plt.subplot(3, 4, 2)
+    plt.errorbar(levels, mean_rewards, yerr=std_rewards, marker='o', linewidth=3, markersize=8, capsize=5)
+    plt.xlabel('Difficulty Level')
+    plt.ylabel('Mean Episode Reward')
+    plt.title('Performance by Difficulty Level')
+    plt.grid(True, alpha=0.3)
+    
+    # 3. Episode Length by Difficulty
+    plt.subplot(3, 4, 3)
+    plt.plot(levels, mean_lengths, 'o-', linewidth=3, markersize=8, color='purple')
+    plt.xlabel('Difficulty Level')
+    plt.ylabel('Mean Episode Length')
+    plt.title('Episode Length by Difficulty')
+    plt.grid(True, alpha=0.3)
+    
+    # 4. Collision Rate by Difficulty
+    plt.subplot(3, 4, 4)
+    bars = plt.bar(levels, collision_rates, color=['darkgreen', 'green', 'orange', 'darkred'], alpha=0.7)
+    plt.xlabel('Difficulty Level')
+    plt.ylabel('Collision Rate')
+    plt.title('Collision Rate by Difficulty Level')
+    plt.ylim(0, max(collision_rates) * 1.2 if collision_rates else 1)
+    for i, bar in enumerate(bars):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                f'{collision_rates[i]:.1%}', ha='center', va='bottom', fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    
+    # 5-8. Individual Difficulty Level Reward Distributions
+    for i, level in enumerate(levels):
+        plt.subplot(3, 4, 5 + i)
+        rewards = all_stats[level]['episode_rewards']
+        plt.hist(rewards, bins=max(3, len(rewards)//2), alpha=0.7, 
+                color=['green', 'lightgreen', 'orange', 'red'][i], edgecolor='black')
+        plt.axvline(np.mean(rewards), color='darkred', linestyle='--', linewidth=2,
+                   label=f'Mean: {np.mean(rewards):.1f}')
+        plt.xlabel('Episode Reward')
+        plt.ylabel('Frequency')
+        plt.title(f'Level {level} Reward Distribution')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+    
+    # 9. Efficiency by Difficulty
+    plt.subplot(3, 4, 9)
+    valid_efficiencies = [eff for eff in mean_efficiencies if eff > 0]
+    valid_levels = [levels[i] for i, eff in enumerate(mean_efficiencies) if eff > 0]
+    if valid_efficiencies:
+        plt.plot(valid_levels, valid_efficiencies, 'o-', linewidth=3, markersize=8, color='teal')
+        plt.xlabel('Difficulty Level')
+        plt.ylabel('Mean Efficiency')
+        plt.title('Path Efficiency by Difficulty')
+        plt.grid(True, alpha=0.3)
+    else:
+        plt.text(0.5, 0.5, 'No efficiency data available', ha='center', va='center', transform=plt.gca().transAxes)
+    
+    # 10. Performance Summary Table
+    plt.subplot(3, 4, 10)
+    plt.axis('off')
+    
+    table_data = []
+    for level in levels:
+        stats = all_stats[level]
+        table_data.append([
+            f"Level {level}",
+            f"{stats['success_rate']:.1%}",
+            f"{stats['mean_reward']:.0f}",
+            f"{stats['collision_rate']:.1%}",
+            f"{stats['mean_length']:.0f}"
+        ])
+    
+    table = plt.table(cellText=table_data,
+                     colLabels=['Level', 'Success', 'Reward', 'Collision', 'Length'],
+                     cellLoc='center',
+                     loc='center',
+                     bbox=[0, 0, 1, 1])
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 2)
+    plt.title('Performance Summary Table', pad=20)
+    
+    # 11. Success Rate Trend
+    plt.subplot(3, 4, 11)
+    plt.plot(levels, success_rates, 'o-', linewidth=4, markersize=10, color='darkgreen')
+    plt.fill_between(levels, success_rates, alpha=0.3, color='green')
+    plt.xlabel('Difficulty Level')
+    plt.ylabel('Success Rate')
+    plt.title('Success Rate Trend')
+    plt.ylim(0, 1.1)
+    plt.grid(True, alpha=0.3)
+    
+    # 12. Overall Performance Score
+    plt.subplot(3, 4, 12)
+    # Calculate overall performance score (weighted by difficulty)
+    performance_scores = []
+    for level in levels:
+        stats = all_stats[level]
+        # Score: success_rate * (1 + difficulty_weight) - collision_rate
+        difficulty_weight = level * 0.2  # Higher levels get bonus
+        score = stats['success_rate'] * (1 + difficulty_weight) - stats['collision_rate'] * 0.5
+        performance_scores.append(score)
+    
+    bars = plt.bar(levels, performance_scores, color=['lightblue', 'blue', 'purple', 'darkblue'], alpha=0.7)
+    plt.xlabel('Difficulty Level')
+    plt.ylabel('Performance Score')
+    plt.title('Overall Performance Score\n(Success Rate + Difficulty Bonus - Collision Penalty)')
+    for i, bar in enumerate(bars):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                f'{performance_scores[i]:.2f}', ha='center', va='bottom', fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_dir:
+        plt.savefig(f"{save_dir}/difficulty_comparison.png", dpi=300, bbox_inches='tight')
+        print(f"📊 Difficulty comparison plots saved to: {save_dir}/difficulty_comparison.png")
+    
+    plt.show()
+
+
+def plot_trajectory_3d(stats, save_dir=None, episode_idx=0, difficulty_level=0):
+    """Create 3D trajectory visualization with obstacles and waypoints."""
+    
+    if not stats['trajectories'] or episode_idx >= len(stats['trajectories']):
+        print("⚠️ No trajectory data available for visualization")
+        return
+    
+    trajectory = np.array(stats['trajectories'][episode_idx])
+    obstacles = stats['obstacles'][episode_idx] if stats['obstacles'] else []
+    
+    # Environment parameters - get from environment
+    start_waypoint = np.array([0.0, 0.0, 1.0])
+    end_waypoints_by_level = [
+        np.array([1.5, 1.5, 1.2]),  # Level 0
+        np.array([2.0, 2.0, 1.3]),  # Level 1
+        np.array([2.8, 2.8, 1.7]),  # Level 2
+        np.array([3.5, 3.5, 2.0])   # Level 3
+    ]
+    end_waypoint = end_waypoints_by_level[difficulty_level]
+    workspace_bounds = 4.0
+    
+    # Create 3D plot
+    fig = plt.figure(figsize=(15, 12))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot workspace bounds (as a wireframe box)
+    bounds = workspace_bounds
+    # Define the vertices of the cube
+    vertices = [
+        [-bounds, -bounds, 0], [bounds, -bounds, 0], [bounds, bounds, 0], [-bounds, bounds, 0],  # bottom
+        [-bounds, -bounds, bounds], [bounds, -bounds, bounds], [bounds, bounds, bounds], [-bounds, bounds, bounds]  # top
+    ]
+    # Define the 12 edges of the cube
+    edges = [
+        [0, 1], [1, 2], [2, 3], [3, 0],  # bottom edges
+        [4, 5], [5, 6], [6, 7], [7, 4],  # top edges
+        [0, 4], [1, 5], [2, 6], [3, 7]   # vertical edges
+    ]
+    for edge in edges:
+        start, end = edge
+        ax.plot3D([vertices[start][0], vertices[end][0]],
+                 [vertices[start][1], vertices[end][1]],
+                 [vertices[start][2], vertices[end][2]], 'k--', alpha=0.3)
+    
+    # Plot obstacles as 3D cubes
+    for i, (obs_pos, obs_size) in enumerate(obstacles):
+        # Create cube vertices
+        x, y, z = obs_pos
+        size = obs_size
+        
+        # Define cube faces
+        cube_vertices = np.array([
+            [x-size, y-size, z-size], [x+size, y-size, z-size], [x+size, y+size, z-size], [x-size, y+size, z-size],
+            [x-size, y-size, z+size], [x+size, y-size, z+size], [x+size, y+size, z+size], [x-size, y+size, z+size]
+        ])
+        
+        # Draw cube edges
+        cube_edges = [
+            [0, 1], [1, 2], [2, 3], [3, 0],  # bottom
+            [4, 5], [5, 6], [6, 7], [7, 4],  # top
+            [0, 4], [1, 5], [2, 6], [3, 7]   # vertical
+        ]
+        
+        for edge in cube_edges:
+            start, end = edge
+            ax.plot3D([cube_vertices[start][0], cube_vertices[end][0]],
+                     [cube_vertices[start][1], cube_vertices[end][1]],
+                     [cube_vertices[start][2], cube_vertices[end][2]], 'r-', linewidth=2, alpha=0.8)
+    
+    # Plot waypoints
+    ax.scatter(start_waypoint[0], start_waypoint[1], start_waypoint[2], 
+              c='green', s=200, marker='o', label='Start', alpha=0.8, edgecolors='darkgreen', linewidth=2)
+    ax.scatter(end_waypoint[0], end_waypoint[1], end_waypoint[2], 
+              c='blue', s=200, marker='s', label='Goal', alpha=0.8, edgecolors='darkblue', linewidth=2)
+    
+    # Plot trajectory
+    if len(trajectory) > 0:
+        traj_x = trajectory[:, 0]
+        traj_y = trajectory[:, 1]
+        traj_z = trajectory[:, 2]
+        
+        # Color trajectory by time (progression)
+        colors = plt.cm.viridis(np.linspace(0, 1, len(trajectory)))
+        
+        # Plot trajectory as connected line segments with color
+        for i in range(len(trajectory) - 1):
+            ax.plot3D([traj_x[i], traj_x[i+1]], [traj_y[i], traj_y[i+1]], [traj_z[i], traj_z[i+1]], 
+                     color=colors[i], linewidth=3, alpha=0.8)
+        
+        # Mark start and end of trajectory
+        ax.scatter(traj_x[0], traj_y[0], traj_z[0], c='lightgreen', s=100, alpha=0.7, label='Traj Start')
+        ax.scatter(traj_x[-1], traj_y[-1], traj_z[-1], c='red', s=100, alpha=0.7, label='Traj End')
+    
+    ax.set_xlabel('X Position (m)')
+    ax.set_ylabel('Y Position (m)')
+    ax.set_zlabel('Z Position (m)')
+    ax.set_title(f'Drone 3D Trajectory - Level {difficulty_level}, Episode {episode_idx + 1}')
+    ax.legend()
+    
+    # Set equal aspect ratio
+    max_range = workspace_bounds
+    ax.set_xlim([-max_range, max_range])
+    ax.set_ylim([-max_range, max_range])
+    ax.set_zlim([0, max_range])
+    
+    # Add trajectory statistics
+    if len(trajectory) > 0:
+        total_distance = np.sum(np.linalg.norm(np.diff(trajectory, axis=0), axis=1))
+        direct_distance = np.linalg.norm(end_waypoint - start_waypoint)
+        efficiency = direct_distance / total_distance if total_distance > 0 else 0
+        
+        stats_text = f"""Trajectory Stats:
+Total Distance: {total_distance:.2f}m
+Direct Distance: {direct_distance:.2f}m
+Path Efficiency: {efficiency:.2%}
+Steps: {len(trajectory)}
+Obstacles: {len(obstacles)}"""
+        
+        # Add text box (position it in the corner)
+        ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, 
+                 verticalalignment='top', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
+    if save_dir:
+        plt.savefig(f"{save_dir}/trajectory_3d_level_{difficulty_level}_episode_{episode_idx+1}.png", 
+                   dpi=300, bbox_inches='tight')
+        print(f"🗺️ 3D trajectory plot saved to: {save_dir}/trajectory_3d_level_{difficulty_level}_episode_{episode_idx+1}.png")
+    
+    plt.show()
 
 
 def main():
     """Main evaluation function."""
-    import argparse
     
-    parser = argparse.ArgumentParser(description='Evaluate trained SAC drone navigation model')
-    parser.add_argument('--model_path', type=str, default='./models/best_model.zip',
-                       help='Path to trained model')
-    parser.add_argument('--norm_path', type=str, default='./models/vec_normalize.pkl',
-                       help='Path to normalization parameters')
-    parser.add_argument('--episodes', type=int, default=10,
-                       help='Number of episodes to evaluate')
-    parser.add_argument('--output_dir', type=str, default='./evaluation_results',
-                       help='Output directory for results')
-    parser.add_argument('--deterministic', action='store_true', default=True,
-                       help='Use deterministic policy')
+    # Configuration - UPDATE THESE PATHS
+    model_dir = "models/progressive_drone_nav_20250629_145417"  # Update with your actual timestamp
+    model_path = f"{model_dir}/final_model.zip"  # or best_model.zip if you prefer
+    normalize_path = f"{model_dir}/vec_normalize.pkl"
+    n_episodes_per_level = 5  # Episodes to run per difficulty level
     
-    args = parser.parse_args()
+    # Create evaluation directory
+    eval_dir = f"evaluation_progressive_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(eval_dir, exist_ok=True)
+    
+    print("🚁 Progressive Drone Navigation Model Evaluation")
+    print(f"📁 Model: {model_path}")
+    print(f"📁 Results will be saved to: {eval_dir}")
     
     # Check if model exists
-    if not os.path.exists(args.model_path):
-        print(f"❌ Model file not found: {args.model_path}")
-        print("Available models:")
-        models_dir = os.path.dirname(args.model_path)
-        if os.path.exists(models_dir):
-            for file in os.listdir(models_dir):
-                if file.endswith('.zip'):
-                    print(f"  - {os.path.join(models_dir, file)}")
+    if not os.path.exists(model_path):
+        print(f"❌ Model file not found: {model_path}")
+        print("Please update the model_dir path in the script")
         return
     
-    # Initialize evaluator
-    evaluator = DroneEvaluator(
-        model_path=args.model_path,
-        normalization_path=args.norm_path if os.path.exists(args.norm_path) else None,
-        output_dir=args.output_dir
-    )
+    # Load model
+    try:
+        model, normalize = load_trained_model(model_path, normalize_path)
+        print("✅ Model loaded successfully!")
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        import traceback
+        traceback.print_exc()
+        return
     
-    # Run evaluation
-    print("🚀 Starting evaluation...")
-    evaluator.run_evaluation(n_episodes=args.episodes, deterministic=args.deterministic)
+    # Create evaluation environment
+    try:
+        eval_env = DummyVecEnv([make_progressive_env(gui=False)])
+        if normalize is not None:
+            eval_env = normalize
+        print("✅ Evaluation environment created!")
+    except Exception as e:
+        print(f"❌ Error creating environment: {e}")
+        import traceback
+        traceback.print_exc()
+        return
     
-    # Generate plots and reports
-    print("📊 Generating plots...")
-    evaluator.plot_trajectories_2d(save_individual=True, save_combined=True)
-    evaluator.plot_performance_metrics()
+    # Evaluate model across all difficulty levels
+    try:
+        all_stats = evaluate_all_difficulties(
+            model, eval_env, n_episodes_per_level=n_episodes_per_level, render=False
+        )
+        
+        # Save comprehensive statistics
+        stats_for_json = {}
+        for level, stats in all_stats.items():
+            stats_copy = stats.copy()
+            # Remove non-serializable data for JSON
+            stats_copy.pop('trajectories', None)
+            stats_copy.pop('obstacles', None)
+            stats_for_json[level] = stats_copy
+        
+        with open(f"{eval_dir}/evaluation_stats.json", 'w') as f:
+            json.dump(stats_for_json, f, indent=2, default=str)
+        
+        # Create comprehensive comparison plots
+        print("\n📊 Creating difficulty comparison plots...")
+        plot_difficulty_comparison(all_stats, save_dir=eval_dir)
+        
+        # Create trajectory plots for best performing episodes at each level
+        print("\n🗺️ Creating trajectory visualizations...")
+        for level, stats in all_stats.items():
+            if stats['trajectories']:
+                # Find episode with highest reward for this level
+                best_episode_idx = np.argmax(stats['episode_rewards'])
+                plot_trajectory_3d(stats, save_dir=eval_dir, 
+                                 episode_idx=best_episode_idx, difficulty_level=level)
+        
+        # Print comprehensive summary
+        print(f"\n✅ Evaluation complete! Results saved to: {eval_dir}")
+        print(f"\n{'='*60}")
+        print("📈 COMPREHENSIVE SUMMARY")
+        print(f"{'='*60}")
+        
+        for level in sorted(all_stats.keys()):
+            stats = all_stats[level]
+            level_names = {0: "Beginner", 1: "Easy", 2: "Medium", 3: "Hard"}
+            print(f"\n🎯 LEVEL {level} ({level_names.get(level, 'Unknown')}):")
+            print(f"   Success Rate: {stats['success_rate']:.1%}")
+            print(f"   Mean Reward: {stats['mean_reward']:.1f} ± {stats['std_reward']:.1f}")
+            print(f"   Collision Rate: {stats['collision_rate']:.1%}")
+            print(f"   Mean Episode Length: {stats['mean_length']:.1f} steps")
+            if stats['efficiency_scores']:
+                print(f"   Mean Efficiency: {stats['mean_efficiency']:.3f}")
+        
+        # Overall assessment
+        overall_success = np.mean([stats['success_rate'] for stats in all_stats.values()])
+        hardest_level_success = all_stats[3]['success_rate']  # Level 3 (hardest)
+        
+        print(f"\n🏆 OVERALL ASSESSMENT:")
+        print(f"   Average Success Rate: {overall_success:.1%}")
+        print(f"   Hardest Level Success: {hardest_level_success:.1%}")
+        
+        if hardest_level_success > 0.8:
+            print("   🌟 EXCELLENT: Agent masters all difficulty levels!")
+        elif hardest_level_success > 0.6:
+            print("   ✅ GOOD: Agent handles most scenarios well")
+        elif hardest_level_success > 0.4:
+            print("   ⚠️ FAIR: Agent struggles with hardest scenarios")
+        else:
+            print("   ❌ NEEDS IMPROVEMENT: Agent fails on difficult scenarios")
+        
+    except Exception as e:
+        print(f"❌ Error during evaluation: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # Save results
-    print("💾 Saving results...")
-    evaluator.save_results()
-    evaluator.generate_report()
-    
-    print("\n🎉 Evaluation completed successfully!")
-    print(f"📁 All results saved to: {args.output_dir}")
+    finally:
+        eval_env.close()
 
 
 if __name__ == "__main__":

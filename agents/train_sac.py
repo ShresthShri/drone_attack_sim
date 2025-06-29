@@ -1,299 +1,699 @@
+#!/usr/bin/env python3
+"""
+Progressive difficulty training - start easy and increase challenge
+"""
+
 import os
 import numpy as np
-import gymnasium as gym
+import torch
 from stable_baselines3 import SAC
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-import torch
-from tqdm import tqdm
+from gym_pybullet_drones.envs.VelocityAviary import VelocityAviary
+from gym_pybullet_drones.utils.enums import DroneModel, Physics
+import gymnasium as gym
+from gymnasium import spaces
+import pybullet as p
+from datetime import datetime
 
-from envs.drone_navigation_env import DroneNavigationEnv
 
-
-class ProgressBarCallback(BaseCallback):
-    """Custom callback to display a progress bar during training."""    
-    def __init__(self, total_timesteps, verbose=0):
+class ProgressiveDifficultyCallback(BaseCallback):
+    """Callback to increase difficulty during training."""
+    
+    def __init__(self, env, verbose=0):
         super().__init__(verbose)
-        self.total_timesteps = total_timesteps
-        self.pbar = None
-        
-    def _on_training_start(self) -> None:
-        """Initialize progress bar when training starts."""
-        self.pbar = tqdm(
-            total=self.total_timesteps,
-            desc="Training SAC",
-            unit="steps",
-            dynamic_ncols=True,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
-        )
+        self.env = env
+        self.last_difficulty_update = 0
         
     def _on_step(self) -> bool:
-        """Update progress bar on each step."""
-        if self.pbar is not None:
-            # Update progress bar
-            self.pbar.update(1)
+        # Increase difficulty every 200k steps
+        if self.num_timesteps - self.last_difficulty_update >= 200000:
+            if hasattr(self.env, 'envs'):
+                for env in self.env.envs:
+                    if hasattr(env.env, 'increase_difficulty'):
+                        env.env.increase_difficulty()
             
-            # Update postfix with current metrics if available
-            if hasattr(self.model, 'logger') and self.model.logger.name_to_value:
-                postfix_dict = {}
-                if 'rollout/ep_rew_mean' in self.model.logger.name_to_value:
-                    postfix_dict['reward'] = f"{self.model.logger.name_to_value['rollout/ep_rew_mean']:.2f}"
-                if 'rollout/ep_len_mean' in self.model.logger.name_to_value:
-                    postfix_dict['ep_len'] = f"{self.model.logger.name_to_value['rollout/ep_len_mean']:.0f}"
-                if 'train/learning_rate' in self.model.logger.name_to_value:
-                    postfix_dict['lr'] = f"{self.model.logger.name_to_value['train/learning_rate']:.2e}"
-                    
-                if postfix_dict:
-                    self.pbar.set_postfix(postfix_dict)
+            self.last_difficulty_update = self.num_timesteps
+            if self.verbose > 0:
+                print(f"\n🎯 Difficulty increased at step {self.num_timesteps}")
         
         return True
-    
-    def _on_training_end(self) -> None:
-        """Close progress bar when training ends."""
-        if self.pbar is not None:
-            self.pbar.close()
 
 
-class TrainingCallback:
-    """Custom callback for monitoring training progress."""
+class ProgressiveObstacleNavigationEnv(VelocityAviary):
+    """
+    Progressive difficulty environment - starts easy, gets harder.
+    """
     
-    def __init__(self, eval_freq=1000, save_freq=5000, save_path="./models/"):
-        self.eval_freq = eval_freq
-        self.save_freq = save_freq
-        self.save_path = save_path
-        os.makedirs(save_path, exist_ok=True)
+    def __init__(self,
+                 drone_model: DroneModel = DroneModel.CF2X,
+                 num_drones: int = 1,
+                 physics: Physics = Physics.PYB,
+                 pyb_freq: int = 240,
+                 ctrl_freq: int = 30,
+                 gui=False,
+                 record=False):
         
-    def setup_callbacks(self, eval_env, total_timesteps):
-        """Setup evaluation, checkpoint, and progress bar callbacks."""
-        # Progress bar callback
-        progress_callback = ProgressBarCallback(total_timesteps)
+        # Environment parameters
+        self.workspace_bounds = 4.0
+        self.obstacles = []
+        self.obstacle_ids = []
         
-        # Stop training when reward threshold is reached
-        reward_threshold_callback = StopTrainingOnRewardThreshold(
-            reward_threshold=80.0,  # Adjust based on your reward scale
-            verbose=1
+        # Progressive difficulty parameters
+        self.difficulty_level = 0  # Start at level 0 (easiest)
+        self.max_difficulty = 3
+        
+        # Difficulty-dependent parameters
+        self.num_obstacles_by_level = [0, 2, 4, 6]  # Start with NO obstacles
+        self.obstacle_sizes_by_level = [
+            [0.1, 0.15],  # Smaller obstacles at easier levels
+            [0.15, 0.2], 
+            [0.2, 0.3],
+            [0.25, 0.35]
+        ]
+        
+        # Waypoints - start closer, get further
+        self.start_waypoint = np.array([-1.0, -3.0, 1.0])
+        self.end_waypoints_by_level = [
+            np.array([1.5, 1.5, 1.2]),  # Level 0: Very close
+            np.array([2.0, 2.0, 1.3]),  # Level 1: Closer
+            np.array([2.8, 2.8, 1.7]),  # Level 2: Medium
+            np.array([3.5, 3.5, 2.0])   # Level 3: Far
+        ]
+        
+        self.waypoint_threshold = 0.3
+        
+        # Safety parameters
+        self.min_obstacle_distance = 0.4
+        self.collision_threshold = 0.15
+        self.max_episode_steps = 1000  # Shorter episodes for faster learning
+        self.current_step = 0
+        self.drone_radius = 0.1
+        
+        # OPTIMIZED REWARD PARAMETERS FOR EARLY LEARNING
+        # Terminal rewards
+        self.success_reward = 500.0  # VERY HIGH success reward
+        self.collision_penalty = -20.0  # Low collision penalty
+        self.oob_penalty = -15.0  # Low OOB penalty
+        
+        # Progress rewards (dominant signal)
+        self.progress_reward_scale = 200.0  # MASSIVE progress reward
+        self.retreat_penalty_scale = 50.0   # Moderate retreat penalty
+        
+        # Minimal penalties
+        self.step_penalty = -0.0001  # Tiny step penalty
+        self.distance_penalty_scale = 0.0  # No distance penalty
+        
+        # Obstacle avoidance
+        self.obstacle_avoidance_scale = 10.0
+        self.safe_distance_reward_scale = 1.0
+        
+        # Efficiency rewards
+        self.velocity_reward_scale = 5.0
+        self.efficiency_bonus_scale = 50.0
+        
+        # State tracking
+        self.prev_distance_to_goal = None
+        self.prev_pos = None
+        self.initial_distance = None
+        self.stagnation_counter = 0
+        self.success_count = 0  # Track successes for difficulty progression
+        
+        # Initialize parent
+        super().__init__(
+            drone_model=drone_model,
+            num_drones=num_drones,
+            initial_xyzs=np.array([self.start_waypoint]),
+            physics=physics,
+            pyb_freq=pyb_freq,
+            ctrl_freq=ctrl_freq,
+            gui=gui,
+            record=record
         )
         
-        # Evaluation callback
-        eval_callback = EvalCallback(
-            eval_env,
-            best_model_save_path=self.save_path,
-            log_path=self.save_path,
-            eval_freq=self.eval_freq,
-            deterministic=True,
-            render=False,
-            callback_on_new_best=reward_threshold_callback,
-            verbose=1
-        )
+    def increase_difficulty(self):
+        """Increase difficulty level."""
+        if self.difficulty_level < self.max_difficulty:
+            self.difficulty_level += 1
+            print(f"🎯 Difficulty increased to level {self.difficulty_level}")
         
-        return [progress_callback, eval_callback]
-
-
-def create_env(gui=False, record=False):
-    """Create the drone navigation environment."""
-    return DroneNavigationEnv(
-        gui=gui,
-        record=record,
-        pyb_freq=240,  # Fixed frequency to avoid issues
-        ctrl_freq=30   # Lower control frequency for stability
-    )
-
-
-def train_sac_drone():
-    """Train SAC agent for drone navigation."""
+    def get_current_end_waypoint(self):
+        """Get end waypoint for current difficulty."""
+        return self.end_waypoints_by_level[self.difficulty_level]
     
-    # Training parameters
-    total_timesteps = 500000
-    learning_rate = 3e-4
-    buffer_size = 100000
-    batch_size = 256
-    tau = 0.005
-    gamma = 0.99
-    train_freq = 1
-    gradient_steps = 1
+    def _observationSpace(self):
+        """Enhanced observation space."""
+        parent_obs_space = super()._observationSpace()
+        
+        if isinstance(parent_obs_space, spaces.Box):
+            original_dim = np.prod(parent_obs_space.shape)
+        else:
+            original_dim = 12
+        
+        additional_dim = 11
+        total_dim = original_dim + additional_dim
+        
+        return spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(total_dim,),
+            dtype=np.float32
+        )
     
-    # Create training environment
-    print("Creating training environment...")
+    def reset(self, seed=None, options=None):
+        """Reset with progressive difficulty."""
+        obs, info = super().reset(seed=seed, options=options)
+        
+        # Clear obstacles safely
+        self._clear_obstacles_safe()
+        
+        # Generate obstacles based on current difficulty
+        self._generate_progressive_obstacles()
+        
+        # Reset tracking
+        self.current_step = 0
+        current_end = self.get_current_end_waypoint()
+        self.initial_distance = np.linalg.norm(self.pos[0] - current_end)
+        self.prev_distance_to_goal = self.initial_distance
+        self.prev_pos = self.pos[0].copy()
+        self.stagnation_counter = 0
+        
+        return self._create_enhanced_observation(obs), info
+    
+    def step(self, action):
+        """Execute step with improved reward structure."""
+        obs, _, terminated, truncated, info = super().step(action)
+        
+        # Calculate reward
+        reward = self._calculate_optimized_reward()
+        
+        # Check termination
+        terminated = self._check_termination()
+        
+        # Track success for difficulty progression
+        if self._is_success():
+            self.success_count += 1
+        
+        # Check truncation
+        self.current_step += 1
+        truncated = self.current_step >= self.max_episode_steps
+        
+        # Enhanced observation
+        enhanced_obs = self._create_enhanced_observation(obs)
+        
+        # Update info
+        current_end = self.get_current_end_waypoint()
+        info.update({
+            'success': self._is_success(),
+            'collision': self._check_collision(),
+            'distance_to_goal': np.linalg.norm(self.pos[0] - current_end),
+            'episode_length': self.current_step,
+            'difficulty_level': self.difficulty_level,
+            'success_count': self.success_count
+        })
+        
+        return enhanced_obs, reward, terminated, truncated, info
+    
+    def _create_enhanced_observation(self, original_obs):
+        """Create enhanced observation."""
+        obs_flat = original_obs.flatten() if hasattr(original_obs, 'flatten') else np.array(original_obs).flatten()
+        
+        current_pos = self.pos[0]
+        current_vel = self.vel[0] if hasattr(self, 'vel') else np.zeros(3)
+        current_end = self.get_current_end_waypoint()
+        
+        # Goal information
+        goal_vector = current_end - current_pos
+        goal_distance = np.linalg.norm(goal_vector)
+        goal_direction = goal_vector / (goal_distance + 1e-8)
+        
+        # Progress metrics
+        progress_ratio = self._get_progress_ratio()
+        
+        # Velocity toward goal
+        velocity_toward_goal = np.dot(current_vel, goal_direction)
+        
+        # Closest obstacle info
+        closest_obstacle_info = self._get_closest_obstacle_info(current_pos)
+        
+        # Efficiency metric
+        efficiency = self._get_efficiency_metric()
+        
+        additional_features = np.array([
+            # Goal direction (normalized)
+            goal_direction[0], goal_direction[1], goal_direction[2],
+            # Goal distance (normalized)
+            goal_distance / self.initial_distance,
+            # Progress ratio
+            progress_ratio,
+            # Velocity alignment with goal
+            np.clip(velocity_toward_goal, -2.0, 2.0),
+            # Closest obstacle info
+            closest_obstacle_info[0], closest_obstacle_info[1],
+            closest_obstacle_info[2], closest_obstacle_info[3],
+            # Efficiency metric
+            efficiency
+        ], dtype=np.float32)
+        
+        return np.concatenate([obs_flat, additional_features])
+    
+    def _calculate_optimized_reward(self):
+        """Optimized reward function for faster learning."""
+        current_pos = self.pos[0]
+        current_vel = self.vel[0] if hasattr(self, 'vel') else np.zeros(3)
+        current_end = self.get_current_end_waypoint()
+        total_reward = 0.0
+        
+        current_distance = np.linalg.norm(current_pos - current_end)
+        
+        # 1. TERMINAL REWARDS
+        if self._is_success():
+            # Massive success reward with difficulty bonus
+            difficulty_bonus = self.difficulty_level * 100.0
+            efficiency_bonus = self.efficiency_bonus_scale * self._get_efficiency_metric()
+            total_reward = self.success_reward + difficulty_bonus + efficiency_bonus
+            print(f"SUCCESS! Level {self.difficulty_level}, Base: {self.success_reward}, "
+                  f"Difficulty: +{difficulty_bonus}, Efficiency: +{efficiency_bonus:.1f}, "
+                  f"Total: {total_reward:.1f}")
+            return total_reward
+        
+        if self._check_collision():
+            return self.collision_penalty
+        
+        if self._check_out_of_bounds():
+            return self.oob_penalty
+        
+        # 2. MASSIVE PROGRESS REWARD (main learning signal)
+        if self.prev_distance_to_goal is not None:
+            progress = self.prev_distance_to_goal - current_distance
+            if progress > 0:
+                # HUGE reward for any progress toward goal
+                progress_reward = progress * self.progress_reward_scale
+                total_reward += progress_reward
+            elif progress < -0.01:  # Only penalize significant retreat
+                retreat_penalty = progress * self.retreat_penalty_scale
+                total_reward += retreat_penalty
+        
+        self.prev_distance_to_goal = current_distance
+        
+        # 3. VELOCITY ALIGNMENT REWARD (encourage right direction)
+        goal_direction = (current_end - current_pos)
+        goal_direction = goal_direction / (np.linalg.norm(goal_direction) + 1e-8)
+        velocity_alignment = np.dot(current_vel, goal_direction)
+        velocity_reward = max(0, velocity_alignment) * self.velocity_reward_scale  # Only positive alignment
+        total_reward += velocity_reward
+        
+        # 4. DISTANCE-BASED MOTIVATION (closer to goal = higher baseline reward)
+        # Give higher baseline reward for being closer to goal
+        max_distance = np.linalg.norm(self.get_current_end_waypoint() - self.start_waypoint)
+        proximity_reward = (1.0 - current_distance / max_distance) * 2.0
+        total_reward += proximity_reward
+        
+        # 5. OBSTACLE AVOIDANCE (only when obstacles exist)
+        if self.obstacles:
+            closest_dist = self._get_closest_obstacle_distance(current_pos)
+            if closest_dist < self.min_obstacle_distance:
+                danger_factor = (self.min_obstacle_distance - closest_dist) / self.min_obstacle_distance
+                obstacle_penalty = -danger_factor * self.obstacle_avoidance_scale
+                total_reward += obstacle_penalty
+            elif closest_dist < self.min_obstacle_distance * 2.0:
+                safety_factor = (closest_dist - self.min_obstacle_distance) / self.min_obstacle_distance
+                safety_reward = safety_factor * self.safe_distance_reward_scale
+                total_reward += safety_reward
+        
+        # 6. MINIMAL EFFICIENCY PENALTIES
+        total_reward += self.step_penalty
+        
+        # 7. ANTI-STAGNATION
+        if self.prev_pos is not None:
+            movement = np.linalg.norm(current_pos - self.prev_pos)
+            if movement < 0.003:
+                self.stagnation_counter += 1
+                if self.stagnation_counter > 20:
+                    total_reward += -0.1
+            else:
+                self.stagnation_counter = 0
+        
+        self.prev_pos = current_pos.copy()
+        
+        return total_reward
+    
+    def _generate_progressive_obstacles(self):
+        """Generate obstacles based on difficulty level."""
+        self.obstacles = []
+        self.obstacle_ids = []
+        
+        num_obstacles = self.num_obstacles_by_level[self.difficulty_level]
+        if num_obstacles == 0:
+            return  # No obstacles at difficulty 0
+        
+        current_end = self.get_current_end_waypoint()
+        obstacle_size_range = self.obstacle_sizes_by_level[self.difficulty_level]
+        
+        # Simple obstacle placement - not blocking direct path initially
+        for i in range(num_obstacles):
+            max_attempts = 20
+            
+            for attempt in range(max_attempts):
+                # Generate position away from direct path
+                if self.difficulty_level <= 1:
+                    # Easy placement - well away from direct path
+                    x = np.random.uniform(-2.0, 2.0)
+                    y = np.random.uniform(-2.0, 2.0)
+                    z = np.random.uniform(0.5, 2.0)
+                    pos = np.array([x, y, z])
+                    
+                    # Ensure not too close to waypoints
+                    start_dist = np.linalg.norm(pos - self.start_waypoint)
+                    end_dist = np.linalg.norm(pos - current_end)
+                    
+                    if start_dist > 1.0 and end_dist > 1.0:
+                        # Check distance from direct path
+                        path_vector = current_end - self.start_waypoint
+                        path_length = np.linalg.norm(path_vector)
+                        path_direction = path_vector / path_length
+                        
+                        start_to_pos = pos - self.start_waypoint
+                        projection_length = np.dot(start_to_pos, path_direction)
+                        projection_point = self.start_waypoint + projection_length * path_direction
+                        path_distance = np.linalg.norm(pos - projection_point)
+                        
+                        if path_distance > 0.8:  # Well away from path
+                            break
+                else:
+                    # Higher difficulty - can be closer to path
+                    x = np.random.uniform(-self.workspace_bounds/2, self.workspace_bounds/2)
+                    y = np.random.uniform(-self.workspace_bounds/2, self.workspace_bounds/2)
+                    z = np.random.uniform(0.5, 2.5)
+                    pos = np.array([x, y, z])
+                    
+                    start_dist = np.linalg.norm(pos - self.start_waypoint)
+                    end_dist = np.linalg.norm(pos - current_end)
+                    
+                    if start_dist > 0.7 and end_dist > 0.7:
+                        break
+            else:
+                # Fallback position
+                angle = i * 2 * np.pi / num_obstacles
+                pos = np.array([
+                    1.5 * np.cos(angle),
+                    1.5 * np.sin(angle),
+                    1.0 + i * 0.2
+                ])
+            
+            # Obstacle size
+            size = np.random.uniform(*obstacle_size_range)
+            
+            # Create obstacle
+            obstacle_id = self._create_obstacle(pos, size)
+            if obstacle_id is not None:
+                self.obstacle_ids.append(obstacle_id)
+                self.obstacles.append({
+                    'position': pos,
+                    'size': size,
+                    'id': obstacle_id
+                })
+    
+    def _create_obstacle(self, pos, size):
+        """Safely create obstacle."""
+        try:
+            collision_shape = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=[size, size, size],
+                physicsClientId=self.CLIENT
+            )
+            
+            if self.GUI:
+                visual_shape = p.createVisualShape(
+                    p.GEOM_BOX,
+                    halfExtents=[size, size, size],
+                    rgbaColor=[0.8, 0.2, 0.2, 0.8],
+                    physicsClientId=self.CLIENT
+                )
+                
+                obstacle_id = p.createMultiBody(
+                    baseMass=0,
+                    baseCollisionShapeIndex=collision_shape,
+                    baseVisualShapeIndex=visual_shape,
+                    basePosition=pos,
+                    physicsClientId=self.CLIENT
+                )
+            else:
+                obstacle_id = p.createMultiBody(
+                    baseMass=0,
+                    baseCollisionShapeIndex=collision_shape,
+                    basePosition=pos,
+                    physicsClientId=self.CLIENT
+                )
+            
+            return obstacle_id
+            
+        except Exception as e:
+            print(f"Warning: Could not create obstacle: {e}")
+            return None
+    
+    def _clear_obstacles_safe(self):
+        """Safely clear obstacles."""
+        for obstacle_id in self.obstacle_ids:
+            try:
+                p.removeBody(obstacle_id, physicsClientId=self.CLIENT)
+            except Exception as e:
+                # Ignore removal errors
+                pass
+        
+        self.obstacles = []
+        self.obstacle_ids = []
+    
+    def _get_progress_ratio(self):
+        """Calculate progress ratio."""
+        if self.initial_distance is None:
+            return 0.0
+        
+        current_end = self.get_current_end_waypoint()
+        current_distance = np.linalg.norm(self.pos[0] - current_end)
+        progress = 1.0 - (current_distance / self.initial_distance)
+        return np.clip(progress, 0.0, 1.0)
+    
+    def _get_efficiency_metric(self):
+        """Calculate efficiency."""
+        if self.current_step == 0:
+            return 1.0
+        
+        current_end = self.get_current_end_waypoint()
+        direct_distance = np.linalg.norm(current_end - self.start_waypoint)
+        time_factor = self.current_step / 800.0  # Target 800 steps
+        efficiency = direct_distance / (direct_distance + time_factor * 1.0)
+        return np.clip(efficiency, 0.0, 1.0)
+    
+    def _get_closest_obstacle_info(self, position):
+        """Get closest obstacle info."""
+        if not self.obstacles:
+            return np.array([10.0, 0.0, 0.0, 0.0])
+        
+        min_distance = float('inf')
+        closest_relative_pos = np.zeros(3)
+        
+        for obstacle in self.obstacles:
+            center_distance = np.linalg.norm(position - obstacle['position'])
+            surface_distance = center_distance - obstacle['size'] - self.drone_radius
+            
+            if surface_distance < min_distance:
+                min_distance = surface_distance
+                closest_relative_pos = obstacle['position'] - position
+        
+        closest_relative_pos = closest_relative_pos / self.workspace_bounds
+        
+        return np.array([
+            np.clip(min_distance / self.workspace_bounds, 0.0, 1.0),
+            closest_relative_pos[0], closest_relative_pos[1], closest_relative_pos[2]
+        ])
+    
+    def _get_closest_obstacle_distance(self, position):
+        """Get distance to closest obstacle."""
+        if not self.obstacles:
+            return float('inf')
+        
+        min_distance = float('inf')
+        for obstacle in self.obstacles:
+            center_distance = np.linalg.norm(position - obstacle['position'])
+            surface_distance = center_distance - obstacle['size'] - self.drone_radius
+            min_distance = min(min_distance, surface_distance)
+        
+        return max(min_distance, 0.0)
+    
+    def _check_collision(self):
+        """Check collision."""
+        current_pos = self.pos[0]
+        
+        # Ground collision
+        if current_pos[2] < 0.05:
+            return True
+        
+        # Obstacle collision
+        if self.obstacles:
+            closest_distance = self._get_closest_obstacle_distance(current_pos)
+            return closest_distance < self.collision_threshold
+        
+        return False
+    
+    def _check_out_of_bounds(self):
+        """Check bounds."""
+        pos = self.pos[0]
+        bounds = self.workspace_bounds
+        
+        return (abs(pos[0]) > bounds or 
+                abs(pos[1]) > bounds or 
+                pos[2] > bounds or 
+                pos[2] < 0.0)
+    
+    def _is_success(self):
+        """Check success."""
+        current_end = self.get_current_end_waypoint()
+        distance = np.linalg.norm(self.pos[0] - current_end)
+        return distance < self.waypoint_threshold
+    
+    def _check_termination(self):
+        """Check termination."""
+        return self._is_success() or self._check_collision() or self._check_out_of_bounds()
+
+
+def make_progressive_env(gui=False):
+    """Create progressive environment."""
+    def _init():
+        env = ProgressiveObstacleNavigationEnv(gui=gui)
+        return Monitor(env)
+    return _init
+
+
+def train_progressive_drone_navigation():
+    """Training with progressive difficulty."""
+    
+    config = {
+        'total_timesteps': 1500000,  # Longer training for progression
+        'learning_rate': 5e-4,  # Higher learning rate for faster convergence
+        'buffer_size': 500000,  # Smaller buffer for faster turnover
+        'batch_size': 128,  # Smaller batches for more frequent updates
+        'learning_starts': 3000,  # Start learning very early
+        'eval_freq': 10000,  # More frequent evaluation
+        'n_eval_episodes': 5,  # Fewer eval episodes for speed
+        'reward_threshold': 1500.0,  # Higher threshold for better performance
+        'n_envs': 8
+    }
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_dir = f"models/progressive_drone_nav_{timestamp}"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print("🚀 Starting Progressive Difficulty Drone Training")
+    print(f"📁 Save directory: {save_dir}")
+    print(f"🎯 Configuration: {config}")
+    
+    # Create environments
     train_env = make_vec_env(
-        lambda: Monitor(create_env(gui=False, record=False)),
-        n_envs=1,
+        make_progressive_env(gui=False),
+        n_envs=config['n_envs'],
         vec_env_cls=DummyVecEnv
     )
     
-    # Normalize observations and rewards
     train_env = VecNormalize(
         train_env,
         norm_obs=True,
-        norm_reward=True,
+        norm_reward=False,
         clip_obs=10.0
     )
     
-    # Create evaluation environment
-    print("Creating evaluation environment...")
     eval_env = make_vec_env(
-        lambda: Monitor(create_env(gui=False, record=False)),
+        make_progressive_env(gui=False),
         n_envs=1,
         vec_env_cls=DummyVecEnv
     )
     eval_env = VecNormalize(
         eval_env,
         norm_obs=True,
-        norm_reward=False,  # Don't normalize rewards for evaluation
-        clip_obs=10.0,
+        norm_reward=False,
         training=False
     )
     
-    # Setup callbacks
-    callback_manager = TrainingCallback(
-        eval_freq=2000,
-        save_freq=10000,
-        save_path="./models/"
-    )
-    callbacks = callback_manager.setup_callbacks(eval_env, total_timesteps)
-    
-    # Create SAC model
-    print("Creating SAC model...")
+    # Create SAC model optimized for fast learning
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"💻 Using device: {device}")
     
     model = SAC(
         "MlpPolicy",
         train_env,
-        learning_rate=learning_rate,
-        buffer_size=buffer_size,
-        batch_size=batch_size,
-        tau=tau,
-        gamma=gamma,
-        train_freq=train_freq,
-        gradient_steps=gradient_steps,
-        learning_starts=1000,
+        learning_rate=config['learning_rate'],
+        buffer_size=config['buffer_size'],
+        batch_size=config['batch_size'],
+        learning_starts=config['learning_starts'],
+        tau=0.01,  # Faster target updates
+        gamma=0.99,  # Standard discount factor
+        train_freq=1,
+        gradient_steps=1,
         policy_kwargs=dict(
-            net_arch=[256, 256],
+            net_arch=[256, 256],  # Smaller network for faster training
             activation_fn=torch.nn.ReLU
         ),
         verbose=1,
-        tensorboard_log="./tensorboard_logs/",
-        device=device
+        device=device,
+        ent_coef='auto',
+        target_update_interval=1,
+        use_sde=True,
+        sde_sample_freq=8  # Less frequent noise sampling
     )
     
-    print("Starting training...")
-    print(f"Total timesteps: {total_timesteps}")
-    print(f"Device: {device}")
-    print(f"Observation space: {train_env.observation_space}")
-    print(f"Action space: {train_env.action_space}")
+    # Callbacks
+    progressive_callback = ProgressiveDifficultyCallback(train_env, verbose=1)
     
-    # Train the model
+    # stop_callback = StopTrainingOnRewardThreshold(
+    #     reward_threshold=config['reward_threshold'],
+    #     verbose=1
+    # )
+    
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=save_dir,
+        eval_freq=config['eval_freq'],
+        n_eval_episodes=config['n_eval_episodes'],
+        deterministic=True,
+        verbose=1,
+        #callback_on_new_best=stop_callback
+    )
+    
+    # Combine callbacks
+    from stable_baselines3.common.callbacks import CallbackList
+    callback_list = CallbackList([progressive_callback, eval_callback])
+   
+    # Train
+    print("\n🎓 Starting progressive training...")
+    print("📊 Level 0: No obstacles, close goal")
+    print("📊 Level 1: 2 obstacles, medium goal") 
+    print("📊 Level 2: 4 obstacles, far goal")
+    print("📊 Level 3: 6 obstacles, very far goal")
+    
     try:
         model.learn(
-            total_timesteps=total_timesteps,
-            callback=callbacks,
-            log_interval=10,
-            tb_log_name="SAC_DroneNavigation"
+            total_timesteps=config['total_timesteps'],
+            callback=callback_list,
+            log_interval=4,
+            progress_bar=True
         )
+        print("✅ Training completed!")
+        
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user.")
-        # Close progress bar if interrupted
-        for callback in callbacks:
-            if isinstance(callback, ProgressBarCallback):
-                callback._on_training_end()
+        print("\n⚠️ Training interrupted")
     
-    # Save final model
-    print("Saving final model...")
-    model.save("./models/sac_drone_navigation_final")
-    train_env.save("./models/vec_normalize.pkl")
-    
-    print("Training completed!")
-    return model, train_env
-
-
-def test_trained_model(model_path="./models/best_model.zip", 
-                      norm_path="./models/vec_normalize.pkl",
-                      episodes=5):
-    """Test the trained model."""
-    
-    print(f"Loading model from {model_path}...")
-    
-    # Create test environment
-    test_env = create_env(gui=False, record=False)
-    test_env = Monitor(test_env)
-    test_env = DummyVecEnv([lambda: test_env])
-    
-    # Load normalization parameters
-    if os.path.exists(norm_path):
-        test_env = VecNormalize.load(norm_path, test_env)
-        test_env.training = False
-        test_env.norm_reward = False
-    
-    # Load model
-    model = SAC.load(model_path, env=test_env)
-    
-    # Test episodes
-    total_rewards = []
-    success_count = 0
-    
-    for episode in range(episodes):
-        obs = test_env.reset()
-        episode_reward = 0
-        done = False
-        step_count = 0
+    finally:
+        model.save(f"{save_dir}/final_model")
+        train_env.save(f"{save_dir}/vec_normalize.pkl")
+        print(f"💾 Model saved to: {save_dir}")
         
-        print(f"\nEpisode {episode + 1}/{episodes}")
-        
-        while not done and step_count < 1000:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, info = test_env.step(action)
-            episode_reward += reward[0]
-            step_count += 1
-            
-            if info[0].get('success', False):
-                success_count += 1
-                print(f"Success! Reached target in {step_count} steps")
-                break
-                
-        total_rewards.append(episode_reward)
-        print(f"Episode reward: {episode_reward:.2f}")
-        print(f"Distance to target: {info[0].get('distance_to_target', 'N/A'):.3f}")
+        train_env.close()
+        eval_env.close()
     
-    print(f"\nTest Results:")
-    print(f"Average reward: {np.mean(total_rewards):.2f} ± {np.std(total_rewards):.2f}")
-    print(f"Success rate: {success_count}/{episodes} ({success_count/episodes*100:.1f}%)")
-    
-    test_env.close()
-
-
-def main():
-    """Main training function."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Train SAC agent for drone navigation')
-    parser.add_argument('--mode', choices=['train', 'test'], default='train',
-                       help='Mode: train or test')
-    parser.add_argument('--model_path', type=str, default='./models/best_model.zip',
-                       help='Path to saved model for testing')
-    parser.add_argument('--episodes', type=int, default=5,
-                       help='Number of test episodes')
-    
-    args = parser.parse_args()
-    
-    if args.mode == 'train':
-        model, env = train_sac_drone()
-        
-        # Test the trained model
-        print("\nTesting trained model...")
-        test_trained_model(episodes=3)
-        
-    elif args.mode == 'test':
-        if not os.path.exists(args.model_path):
-            print(f"Model file {args.model_path} not found!")
-            return
-        
-        test_trained_model(
-            model_path=args.model_path,
-            episodes=args.episodes
-        )
+    return model, save_dir
 
 
 if __name__ == "__main__":
-    main()
+    train_progressive_drone_navigation()
