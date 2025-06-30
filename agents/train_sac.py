@@ -77,10 +77,10 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         # Waypoints - start closer, get further
         self.start_waypoint = np.array([-1.0, -3.0, 1.0])
         self.end_waypoints_by_level = [
-            np.array([1.5, 1.5, 1.2]),  # Level 0: Very close
-            np.array([2.0, 2.0, 1.3]),  # Level 1: Closer
-            np.array([2.8, 2.8, 1.7]),  # Level 2: Medium
-            np.array([3.5, 3.5, 2.0])   # Level 3: Far
+            np.array([0.0, 1.5, 1.2]),  # Level 0: Very close
+            np.array([0.0, 2.0, 1.3]),  # Level 1: Closer
+            np.array([0.0, 2.8, 1.7]),  # Level 2: Medium
+            np.array([0.0, 3.5, 2.0])   # Level 3: Far
         ]
         
         self.waypoint_threshold = 0.3
@@ -152,7 +152,7 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         else:
             original_dim = 12
         
-        additional_dim = 11
+        additional_dim = 7
         total_dim = original_dim + additional_dim
         
         return spaces.Box(
@@ -217,14 +217,14 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         return enhanced_obs, reward, terminated, truncated, info
     
     def _create_enhanced_observation(self, original_obs):
-        """Create enhanced observation."""
+        """Create destination-only observation - NO obstacle information."""
         obs_flat = original_obs.flatten() if hasattr(original_obs, 'flatten') else np.array(original_obs).flatten()
         
         current_pos = self.pos[0]
         current_vel = self.vel[0] if hasattr(self, 'vel') else np.zeros(3)
         current_end = self.get_current_end_waypoint()
         
-        # Goal information
+        # Goal information ONLY
         goal_vector = current_end - current_pos
         goal_distance = np.linalg.norm(goal_vector)
         goal_direction = goal_vector / (goal_distance + 1e-8)
@@ -235,12 +235,10 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         # Velocity toward goal
         velocity_toward_goal = np.dot(current_vel, goal_direction)
         
-        # Closest obstacle info
-        closest_obstacle_info = self._get_closest_obstacle_info(current_pos)
-        
         # Efficiency metric
         efficiency = self._get_efficiency_metric()
         
+        # DESTINATION-ONLY FEATURES (no obstacle info)
         additional_features = np.array([
             # Goal direction (normalized)
             goal_direction[0], goal_direction[1], goal_direction[2],
@@ -250,9 +248,6 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
             progress_ratio,
             # Velocity alignment with goal
             np.clip(velocity_toward_goal, -2.0, 2.0),
-            # Closest obstacle info
-            closest_obstacle_info[0], closest_obstacle_info[1],
-            closest_obstacle_info[2], closest_obstacle_info[3],
             # Efficiency metric
             efficiency
         ], dtype=np.float32)
@@ -311,17 +306,17 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         proximity_reward = (1.0 - current_distance / max_distance) * 2.0
         total_reward += proximity_reward
         
-        # 5. OBSTACLE AVOIDANCE (only when obstacles exist)
-        if self.obstacles:
-            closest_dist = self._get_closest_obstacle_distance(current_pos)
-            if closest_dist < self.min_obstacle_distance:
-                danger_factor = (self.min_obstacle_distance - closest_dist) / self.min_obstacle_distance
-                obstacle_penalty = -danger_factor * self.obstacle_avoidance_scale
-                total_reward += obstacle_penalty
-            elif closest_dist < self.min_obstacle_distance * 2.0:
-                safety_factor = (closest_dist - self.min_obstacle_distance) / self.min_obstacle_distance
-                safety_reward = safety_factor * self.safe_distance_reward_scale
-                total_reward += safety_reward
+        # # 5. OBSTACLE AVOIDANCE (only when obstacles exist)
+        # if self.obstacles:
+        #     closest_dist = self._get_closest_obstacle_distance(current_pos)
+        #     if closest_dist < self.min_obstacle_distance:
+        #         danger_factor = (self.min_obstacle_distance - closest_dist) / self.min_obstacle_distance
+        #         obstacle_penalty = -danger_factor * self.obstacle_avoidance_scale
+        #         total_reward += obstacle_penalty
+        #     elif closest_dist < self.min_obstacle_distance * 2.0:
+        #         safety_factor = (closest_dist - self.min_obstacle_distance) / self.min_obstacle_distance
+        #         safety_reward = safety_factor * self.safe_distance_reward_scale
+        #         total_reward += safety_reward
         
         # 6. MINIMAL EFFICIENCY PENALTIES
         total_reward += self.step_penalty

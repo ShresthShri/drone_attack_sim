@@ -471,11 +471,124 @@ Obstacles: {len(obstacles)}"""
     plt.show()
 
 
+def plot_trajectory_2d(stats, save_dir=None, episode_idx=0, difficulty_level=0):
+    """Create 2D trajectory visualization with obstacles and waypoints (top-down view)."""
+    
+    if not stats['trajectories'] or episode_idx >= len(stats['trajectories']):
+        print("⚠️ No trajectory data available for 2D visualization")
+        return
+    
+    trajectory = np.array(stats['trajectories'][episode_idx])
+    obstacles = stats['obstacles'][episode_idx] if stats['obstacles'] else []
+    
+    # Environment parameters - match your training script
+    start_waypoint = np.array([-1.0, -3.0, 1.0])  # Updated to match your code
+    end_waypoints_by_level = [
+        np.array([0.0, 1.5, 1.2]),  # Level 0
+        np.array([0.0, 2.0, 1.3]),  # Level 1
+        np.array([0.0, 2.8, 1.7]),  # Level 2
+        np.array([0.0, 3.5, 2.0])   # Level 3
+    ]
+    end_waypoint = end_waypoints_by_level[difficulty_level]
+    workspace_bounds = 4.0
+    
+    # Create 2D plot (X-Y plane, top-down view)
+    fig, ax = plt.subplots(figsize=(12, 10))  # Get both figure and axes
+    
+    # Plot workspace bounds
+    ax.plot([-workspace_bounds, workspace_bounds, workspace_bounds, -workspace_bounds, -workspace_bounds],
+            [-workspace_bounds, -workspace_bounds, workspace_bounds, workspace_bounds, -workspace_bounds],
+            'k--', linewidth=2, alpha=0.5, label='Workspace Bounds')
+    
+    # Plot obstacles (top-down view as squares)
+    for i, (obs_pos, obs_size) in enumerate(obstacles):
+        obs_x, obs_y = obs_pos[0], obs_pos[1]
+        # Draw obstacle as square (top-down view)
+        square = plt.Rectangle((obs_x - obs_size, obs_y - obs_size), 
+                              2 * obs_size, 2 * obs_size,
+                              facecolor='red', alpha=0.6, edgecolor='darkred', linewidth=2)
+        ax.add_patch(square)
+        ax.text(obs_x, obs_y, f'{i+1}', ha='center', va='center', 
+                fontweight='bold', color='white', fontsize=10)
+    
+    # Plot waypoints
+    ax.plot(start_waypoint[0], start_waypoint[1], 'go', markersize=15, 
+            label='Start', markeredgecolor='darkgreen', markeredgewidth=2)
+    ax.plot(end_waypoint[0], end_waypoint[1], 'bs', markersize=15, 
+            label='Goal', markeredgecolor='darkblue', markeredgewidth=2)
+    
+    # Plot direct path (ideal route)
+    ax.plot([start_waypoint[0], end_waypoint[0]], [start_waypoint[1], end_waypoint[1]], 
+            'gray', linestyle=':', linewidth=2, alpha=0.7, label='Direct Path')
+    
+    # Plot trajectory
+    if len(trajectory) > 0:
+        traj_x = trajectory[:, 0]
+        traj_y = trajectory[:, 1]
+        
+        # Color trajectory by time progression
+        colors = plt.cm.viridis(np.linspace(0, 1, len(trajectory)))
+        
+        # Plot trajectory with color gradient
+        for i in range(len(trajectory) - 1):
+            ax.plot([traj_x[i], traj_x[i+1]], [traj_y[i], traj_y[i+1]], 
+                   color=colors[i], linewidth=3, alpha=0.8)
+        
+        # Mark trajectory start and end
+        ax.plot(traj_x[0], traj_y[0], 'go', markersize=8, alpha=0.8, 
+               markeredgecolor='darkgreen', label='Traj Start')
+        ax.plot(traj_x[-1], traj_y[-1], 'ro', markersize=8, alpha=0.8, 
+               markeredgecolor='darkred', label='Traj End')
+        
+        # Add colorbar for time progression - FIX: specify the axes
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, 
+                                  norm=plt.Normalize(vmin=0, vmax=len(trajectory)))
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax)  # <-- FIX: specify ax parameter
+        cbar.set_label('Time Step', rotation=270, labelpad=20)
+    
+    ax.set_xlabel('X Position (m)', fontsize=12)
+    ax.set_ylabel('Y Position (m)', fontsize=12)
+    ax.set_title(f'Drone 2D Trajectory - Level {difficulty_level}, Episode {episode_idx + 1}\n'
+                f'Top-Down View (X-Y Plane)', fontsize=14)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')  # Changed from plt.axis('equal')
+    
+    # Add trajectory statistics
+    if len(trajectory) > 0:
+        total_distance = np.sum(np.linalg.norm(np.diff(trajectory, axis=0), axis=1))
+        direct_distance = np.linalg.norm(end_waypoint[:2] - start_waypoint[:2])  # 2D distance
+        efficiency = direct_distance / total_distance if total_distance > 0 else 0
+        
+        stats_text = f"""Trajectory Stats:
+        Total Distance: {total_distance:.2f}m
+        Direct Distance: {direct_distance:.2f}m
+        Path Efficiency: {efficiency:.2%}
+        Steps: {len(trajectory)}
+        Obstacles: {len(obstacles)}
+        Max Altitude: {np.max(trajectory[:, 2]):.2f}m"""
+        
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+               verticalalignment='top', fontsize=10,
+               bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
+    plt.tight_layout()
+    
+    if save_dir:
+        plt.savefig(f"{save_dir}/trajectory_2d_level_{difficulty_level}_episode_{episode_idx+1}.png", 
+                   dpi=300, bbox_inches='tight')
+        print(f"🗺️ 2D trajectory plot saved to: {save_dir}/trajectory_2d_level_{difficulty_level}_episode_{episode_idx+1}.png")
+    
+    plt.show()
+   
+
+
 def main():
     """Main evaluation function."""
     
     # Configuration - UPDATE THESE PATHS
-    model_dir = "models/progressive_drone_nav_20250629_145417"  # Update with your actual timestamp
+    model_dir = "models/progressive_drone_nav_20250630_125854"  # Update with your actual timestamp
     model_path = f"{model_dir}/final_model.zip"  # or best_model.zip if you prefer
     normalize_path = f"{model_dir}/vec_normalize.pkl"
     n_episodes_per_level = 5  # Episodes to run per difficulty level
@@ -539,13 +652,16 @@ def main():
         plot_difficulty_comparison(all_stats, save_dir=eval_dir)
         
         # Create trajectory plots for best performing episodes at each level
-        print("\n🗺️ Creating trajectory visualizations...")
         for level, stats in all_stats.items():
             if stats['trajectories']:
                 # Find episode with highest reward for this level
                 best_episode_idx = np.argmax(stats['episode_rewards'])
+                
+                # Create both 3D and 2D plots
                 plot_trajectory_3d(stats, save_dir=eval_dir, 
-                                 episode_idx=best_episode_idx, difficulty_level=level)
+                                episode_idx=best_episode_idx, difficulty_level=level)
+                plot_trajectory_2d(stats, save_dir=eval_dir, 
+                                episode_idx=best_episode_idx, difficulty_level=level)
         
         # Print comprehensive summary
         print(f"\n✅ Evaluation complete! Results saved to: {eval_dir}")
