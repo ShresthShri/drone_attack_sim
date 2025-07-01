@@ -1,0 +1,5 @@
+/var/spool/slurm/d/job178660/slurm_script: line 21: drone_venv/bin/activate: No such file or directory
+Traceback (most recent call last):
+  File "/homes/ss5921/Dissertation/drone_attack_sim/agents/train_sac.py", line 8, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'

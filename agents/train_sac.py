@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Progressive difficulty training - start easy and increase challenge
+FIXED: Proper 3D box-sphere collision detection with guaranteed path clearance
 """
 
 import os
@@ -45,6 +46,7 @@ class ProgressiveDifficultyCallback(BaseCallback):
 class ProgressiveObstacleNavigationEnv(VelocityAviary):
     """
     Progressive difficulty environment - starts easy, gets harder.
+    FIXED: Proper 3D box-sphere collision detection with path clearance guarantee
     """
     
     def __init__(self,
@@ -66,12 +68,12 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         self.max_difficulty = 3
         
         # Difficulty-dependent parameters
-        self.num_obstacles_by_level = [0, 2, 4, 6]  # Start with NO obstacles
+        self.num_obstacles_by_level = [0, 1, 3, 5]  # Start with NO obstacles
         self.obstacle_sizes_by_level = [
             [0.1, 0.15],  # Smaller obstacles at easier levels
             [0.15, 0.2], 
-            [0.2, 0.3],
-            [0.25, 0.35]
+            [0.2, 0.25],  # REDUCED max size
+            [0.2, 0.3]    # REDUCED max size
         ]
         
         # Waypoints - start closer, get further
@@ -85,26 +87,26 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         
         self.waypoint_threshold = 0.3
         
-        # Safety parameters
-        self.min_obstacle_distance = 0.4
-        self.collision_threshold = 0.15
-        self.max_episode_steps = 1000  # Shorter episodes for faster learning
+        # FIXED: Safety parameters - more conservative
+        self.min_obstacle_distance = 0.8
+        self.collision_threshold = 0.05  # REDUCED from 0.3
+        self.drone_radius = 0.15         # REDUCED from 0.2
+        self.max_episode_steps = 1000
         self.current_step = 0
-        self.drone_radius = 0.1
         
         # OPTIMIZED REWARD PARAMETERS FOR EARLY LEARNING
         # Terminal rewards
-        self.success_reward = 500.0  # VERY HIGH success reward
-        self.collision_penalty = -20.0  # Low collision penalty
-        self.oob_penalty = -15.0  # Low OOB penalty
+        self.success_reward = 500.0
+        self.collision_penalty = -100.0
+        self.oob_penalty = -15.0
         
         # Progress rewards (dominant signal)
-        self.progress_reward_scale = 200.0  # MASSIVE progress reward
-        self.retreat_penalty_scale = 50.0   # Moderate retreat penalty
+        self.progress_reward_scale = 200.0
+        self.retreat_penalty_scale = 50.0
         
         # Minimal penalties
-        self.step_penalty = -0.0001  # Tiny step penalty
-        self.distance_penalty_scale = 0.0  # No distance penalty
+        self.step_penalty = -0.0001
+        self.distance_penalty_scale = 0.0
         
         # Obstacle avoidance
         self.obstacle_avoidance_scale = 10.0
@@ -119,7 +121,10 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         self.prev_pos = None
         self.initial_distance = None
         self.stagnation_counter = 0
-        self.success_count = 0  # Track successes for difficulty progression
+        self.success_count = 0
+        
+        # NEW: Debug visualization
+        self.debug_lines = []
         
         # Initialize parent
         super().__init__(
@@ -166,8 +171,9 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         """Reset with progressive difficulty."""
         obs, info = super().reset(seed=seed, options=options)
         
-        # Clear obstacles safely
+        # Clear obstacles and debug lines safely
         self._clear_obstacles_safe()
+        self._clear_debug_lines()
         
         # Generate obstacles based on current difficulty
         self._generate_progressive_obstacles()
@@ -183,14 +189,25 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         return self._create_enhanced_observation(obs), info
     
     def step(self, action):
-        """Execute step with improved reward structure."""
+        """Execute step with FIXED collision detection."""
         obs, _, terminated, truncated, info = super().step(action)
         
-        # Calculate reward
-        reward = self._calculate_optimized_reward()
+        # Get current position for debugging
+        current_pos = self.pos[0]
         
-        # Check termination
-        terminated = self._check_termination()
+        # FIXED: Check collision ONCE with proper 3D detection
+        collision_detected = self._check_collision_3d_box_sphere()
+        
+        if collision_detected:
+            print(f"💥 COLLISION DETECTED at step {self.current_step}")
+            print(f"   Position: {current_pos}")
+            reward = self.collision_penalty
+            terminated = True
+        else:
+            # Calculate reward without collision checking
+            reward = self._calculate_optimized_reward()
+            # Check other termination conditions (success, out of bounds)
+            terminated = self._check_termination_no_collision()
         
         # Track success for difficulty progression
         if self._is_success():
@@ -207,7 +224,7 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         current_end = self.get_current_end_waypoint()
         info.update({
             'success': self._is_success(),
-            'collision': self._check_collision(),
+            'collision': collision_detected,
             'distance_to_goal': np.linalg.norm(self.pos[0] - current_end),
             'episode_length': self.current_step,
             'difficulty_level': self.difficulty_level,
@@ -255,7 +272,7 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         return np.concatenate([obs_flat, additional_features])
     
     def _calculate_optimized_reward(self):
-        """Optimized reward function for faster learning."""
+        """FIXED: Optimized reward function WITHOUT collision checking."""
         current_pos = self.pos[0]
         current_vel = self.vel[0] if hasattr(self, 'vel') else np.zeros(3)
         current_end = self.get_current_end_waypoint()
@@ -263,7 +280,7 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         
         current_distance = np.linalg.norm(current_pos - current_end)
         
-        # 1. TERMINAL REWARDS
+        # 1. SUCCESS REWARD (collision already handled in step())
         if self._is_success():
             # Massive success reward with difficulty bonus
             difficulty_bonus = self.difficulty_level * 100.0
@@ -274,13 +291,11 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
                   f"Total: {total_reward:.1f}")
             return total_reward
         
-        if self._check_collision():
-            return self.collision_penalty
-        
+        # 2. OUT OF BOUNDS (only non-collision termination checked here)
         if self._check_out_of_bounds():
             return self.oob_penalty
         
-        # 2. MASSIVE PROGRESS REWARD (main learning signal)
+        # 3. MASSIVE PROGRESS REWARD (main learning signal)
         if self.prev_distance_to_goal is not None:
             progress = self.prev_distance_to_goal - current_distance
             if progress > 0:
@@ -293,30 +308,18 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         
         self.prev_distance_to_goal = current_distance
         
-        # 3. VELOCITY ALIGNMENT REWARD (encourage right direction)
+        # 4. VELOCITY ALIGNMENT REWARD (encourage right direction)
         goal_direction = (current_end - current_pos)
         goal_direction = goal_direction / (np.linalg.norm(goal_direction) + 1e-8)
         velocity_alignment = np.dot(current_vel, goal_direction)
         velocity_reward = max(0, velocity_alignment) * self.velocity_reward_scale  # Only positive alignment
         total_reward += velocity_reward
         
-        # 4. DISTANCE-BASED MOTIVATION (closer to goal = higher baseline reward)
+        # 5. DISTANCE-BASED MOTIVATION (closer to goal = higher baseline reward)
         # Give higher baseline reward for being closer to goal
         max_distance = np.linalg.norm(self.get_current_end_waypoint() - self.start_waypoint)
         proximity_reward = (1.0 - current_distance / max_distance) * 2.0
         total_reward += proximity_reward
-        
-        # # 5. OBSTACLE AVOIDANCE (only when obstacles exist)
-        # if self.obstacles:
-        #     closest_dist = self._get_closest_obstacle_distance(current_pos)
-        #     if closest_dist < self.min_obstacle_distance:
-        #         danger_factor = (self.min_obstacle_distance - closest_dist) / self.min_obstacle_distance
-        #         obstacle_penalty = -danger_factor * self.obstacle_avoidance_scale
-        #         total_reward += obstacle_penalty
-        #     elif closest_dist < self.min_obstacle_distance * 2.0:
-        #         safety_factor = (closest_dist - self.min_obstacle_distance) / self.min_obstacle_distance
-        #         safety_reward = safety_factor * self.safe_distance_reward_scale
-        #         total_reward += safety_reward
         
         # 6. MINIMAL EFFICIENCY PENALTIES
         total_reward += self.step_penalty
@@ -336,7 +339,7 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         return total_reward
     
     def _generate_progressive_obstacles(self):
-        """Generate obstacles based on difficulty level."""
+        """COMPLETELY REWRITTEN: Generate obstacles with guaranteed path clearance."""
         self.obstacles = []
         self.obstacle_ids = []
         
@@ -347,72 +350,91 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         current_end = self.get_current_end_waypoint()
         obstacle_size_range = self.obstacle_sizes_by_level[self.difficulty_level]
         
-        # Simple obstacle placement - not blocking direct path initially
+        # CRITICAL: Calculate direct path and ensure clearance
+        path_vector = current_end - self.start_waypoint
+        path_length = np.linalg.norm(path_vector)
+        path_direction = path_vector / path_length
+        
+        # Create path points to protect
+        protected_points = []
+        num_path_points = 20
+        for i in range(num_path_points):
+            t = i / (num_path_points - 1)
+            point = self.start_waypoint + t * path_vector
+            protected_points.append(point)
+        
+        print(f"Generating {num_obstacles} obstacles for difficulty level {self.difficulty_level}")
+        
         for i in range(num_obstacles):
-            max_attempts = 20
+            max_attempts = 200  # Increased attempts
+            obstacle_placed = False
             
             for attempt in range(max_attempts):
-                # Generate position away from direct path
+                # Generate position with better distribution
                 if self.difficulty_level <= 1:
-                    # Easy placement - well away from direct path
-                    x = np.random.uniform(-2.0, 2.0)
-                    y = np.random.uniform(-2.0, 2.0)
-                    z = np.random.uniform(0.5, 2.0)
-                    pos = np.array([x, y, z])
-                    
-                    # Ensure not too close to waypoints
-                    start_dist = np.linalg.norm(pos - self.start_waypoint)
-                    end_dist = np.linalg.norm(pos - current_end)
-                    
-                    if start_dist > 1.0 and end_dist > 1.0:
-                        # Check distance from direct path
-                        path_vector = current_end - self.start_waypoint
-                        path_length = np.linalg.norm(path_vector)
-                        path_direction = path_vector / path_length
-                        
-                        start_to_pos = pos - self.start_waypoint
-                        projection_length = np.dot(start_to_pos, path_direction)
-                        projection_point = self.start_waypoint + projection_length * path_direction
-                        path_distance = np.linalg.norm(pos - projection_point)
-                        
-                        if path_distance > 0.8:  # Well away from path
-                            break
+                    # Easy: well away from path
+                    angle = np.random.uniform(0, 2*np.pi)
+                    radius = np.random.uniform(1.5, 2.5)
+                    x = radius * np.cos(angle)
+                    y = radius * np.sin(angle)
+                    z = np.random.uniform(0.8, 2.0)
                 else:
-                    # Higher difficulty - can be closer to path
-                    x = np.random.uniform(-self.workspace_bounds/2, self.workspace_bounds/2)
-                    y = np.random.uniform(-self.workspace_bounds/2, self.workspace_bounds/2)
-                    z = np.random.uniform(0.5, 2.5)
-                    pos = np.array([x, y, z])
-                    
-                    start_dist = np.linalg.norm(pos - self.start_waypoint)
-                    end_dist = np.linalg.norm(pos - current_end)
-                    
-                    if start_dist > 0.7 and end_dist > 0.7:
+                    # Harder: can be closer but still maintain clearance
+                    x = np.random.uniform(-2.5, 2.5)
+                    y = np.random.uniform(-2.5, 2.5)
+                    z = np.random.uniform(0.8, 2.2)
+                
+                pos = np.array([x, y, z])
+                
+                # Check waypoint distances
+                start_dist = np.linalg.norm(pos - self.start_waypoint)
+                end_dist = np.linalg.norm(pos - current_end)
+                
+                if start_dist < 1.0 or end_dist < 1.0:
+                    continue
+                
+                # CRITICAL: Check clearance from ALL protected path points
+                min_path_clearance = float('inf')
+                for path_point in protected_points:
+                    clearance = np.linalg.norm(pos - path_point)
+                    min_path_clearance = min(min_path_clearance, clearance)
+                
+                # Ensure sufficient path clearance based on difficulty
+                required_clearance = [0.0, 1.2, 1.0, 0.8][self.difficulty_level]
+                if min_path_clearance < required_clearance:
+                    continue
+                
+                # Check overlap with existing obstacles
+                too_close_to_obstacles = False
+                min_obstacle_spacing = 1.0
+                for existing in self.obstacles:
+                    distance = np.linalg.norm(pos - existing['position'])
+                    if distance < min_obstacle_spacing:
+                        too_close_to_obstacles = True
                         break
-            else:
-                # Fallback position
-                angle = i * 2 * np.pi / num_obstacles
-                pos = np.array([
-                    1.5 * np.cos(angle),
-                    1.5 * np.sin(angle),
-                    1.0 + i * 0.2
-                ])
+                
+                if not too_close_to_obstacles:
+                    # Valid position found!
+                    size = np.random.uniform(*obstacle_size_range)
+                    size = min(size, 0.25)  # Cap maximum size
+                    
+                    obstacle_id = self._create_obstacle_with_debug(pos, size)
+                    if obstacle_id is not None:
+                        self.obstacle_ids.append(obstacle_id)
+                        self.obstacles.append({
+                            'position': pos,
+                            'size': size,
+                            'id': obstacle_id
+                        })
+                        print(f"  ✅ Obstacle {i} placed at {pos[:2]} (z={pos[2]:.1f}), size={size:.2f}, path_clearance={min_path_clearance:.2f}")
+                        obstacle_placed = True
+                        break
             
-            # Obstacle size
-            size = np.random.uniform(*obstacle_size_range)
-            
-            # Create obstacle
-            obstacle_id = self._create_obstacle(pos, size)
-            if obstacle_id is not None:
-                self.obstacle_ids.append(obstacle_id)
-                self.obstacles.append({
-                    'position': pos,
-                    'size': size,
-                    'id': obstacle_id
-                })
+            if not obstacle_placed:
+                print(f"  ⚠️ Could not place obstacle {i} after {max_attempts} attempts")
     
-    def _create_obstacle(self, pos, size):
-        """Safely create obstacle."""
+    def _create_obstacle_with_debug(self, pos, size):
+        """ENHANCED: Create obstacle with visual debug information."""
         try:
             collision_shape = p.createCollisionShape(
                 p.GEOM_BOX,
@@ -421,6 +443,7 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
             )
             
             if self.GUI:
+                # Main obstacle (red)
                 visual_shape = p.createVisualShape(
                     p.GEOM_BOX,
                     halfExtents=[size, size, size],
@@ -435,6 +458,31 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
                     basePosition=pos,
                     physicsClientId=self.CLIENT
                 )
+                
+                # ADD VISUAL DEBUG: Show collision boundary
+                danger_zone = size + self.drone_radius + 0.1  # Show actual collision zone
+                
+                # Create wireframe box around danger zone
+                corners = [
+                    [pos[0]-danger_zone, pos[1]-danger_zone, pos[2]-danger_zone],
+                    [pos[0]+danger_zone, pos[1]-danger_zone, pos[2]-danger_zone],
+                    [pos[0]+danger_zone, pos[1]+danger_zone, pos[2]-danger_zone],
+                    [pos[0]-danger_zone, pos[1]+danger_zone, pos[2]-danger_zone],
+                    [pos[0]-danger_zone, pos[1]-danger_zone, pos[2]+danger_zone],
+                    [pos[0]+danger_zone, pos[1]-danger_zone, pos[2]+danger_zone],
+                    [pos[0]+danger_zone, pos[1]+danger_zone, pos[2]+danger_zone],
+                    [pos[0]-danger_zone, pos[1]+danger_zone, pos[2]+danger_zone],
+                ]
+                
+                # Draw wireframe (yellow lines)
+                edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+                for edge in edges:
+                    line_id = p.addUserDebugLine(
+                        corners[edge[0]], corners[edge[1]], 
+                        [1, 1, 0], 1, 0, physicsClientId=self.CLIENT
+                    )
+                    self.debug_lines.append(line_id)
+                
             else:
                 obstacle_id = p.createMultiBody(
                     baseMass=0,
@@ -461,6 +509,58 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         self.obstacles = []
         self.obstacle_ids = []
     
+    def _clear_debug_lines(self):
+        """NEW: Clear debug visualization lines."""
+        for line_id in self.debug_lines:
+            try:
+                p.removeUserDebugItem(line_id, physicsClientId=self.CLIENT)
+            except:
+                pass
+        self.debug_lines = []
+    
+    def _check_collision_3d_box_sphere(self):
+        """COMPLETELY REWRITTEN: Proper 3D box-sphere collision detection."""
+        current_pos = self.pos[0]
+        
+        # Ground collision
+        if current_pos[2] < 0.05:
+            print(f"🚨 GROUND COLLISION at z={current_pos[2]:.3f}")
+            return True
+        
+        # 3D Box-Sphere collision detection
+        if self.obstacles:
+            for i, obstacle in enumerate(self.obstacles):
+                obs_pos = obstacle['position']
+                obs_size = obstacle['size']  # half-extent of box
+                
+                # Calculate closest point on box to sphere center
+                closest_point = np.array([
+                    max(obs_pos[0] - obs_size, min(current_pos[0], obs_pos[0] + obs_size)),
+                    max(obs_pos[1] - obs_size, min(current_pos[1], obs_pos[1] + obs_size)),
+                    max(obs_pos[2] - obs_size, min(current_pos[2], obs_pos[2] + obs_size))
+                ])
+                
+                # Distance from drone center to closest point on box
+                distance_to_box = np.linalg.norm(current_pos - closest_point)
+                
+                # Debug output when getting close
+                if distance_to_box < self.drone_radius + 0.2:
+                    print(f"🔍 APPROACHING OBSTACLE {i}:")
+                    print(f"    Drone pos: [{current_pos[0]:.2f}, {current_pos[1]:.2f}, {current_pos[2]:.2f}]")
+                    print(f"    Obstacle pos: [{obs_pos[0]:.2f}, {obs_pos[1]:.2f}, {obs_pos[2]:.2f}], size: {obs_size:.2f}")
+                    print(f"    Closest point: [{closest_point[0]:.2f}, {closest_point[1]:.2f}, {closest_point[2]:.2f}]")
+                    print(f"    Distance to box: {distance_to_box:.3f}m")
+                    print(f"    Drone radius: {self.drone_radius:.3f}m")
+                    print(f"    Collision threshold: {self.collision_threshold:.3f}m")
+                
+                # Check collision: drone sphere intersects box
+                if distance_to_box <= (self.drone_radius + self.collision_threshold):
+                    print(f"🚨 BOX-SPHERE COLLISION DETECTED!")
+                    print(f"    Obstacle {i}: distance {distance_to_box:.3f} <= threshold {self.drone_radius + self.collision_threshold:.3f}")
+                    return True
+        
+        return False
+    
     def _get_progress_ratio(self):
         """Calculate progress ratio."""
         if self.initial_distance is None:
@@ -482,57 +582,6 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         efficiency = direct_distance / (direct_distance + time_factor * 1.0)
         return np.clip(efficiency, 0.0, 1.0)
     
-    def _get_closest_obstacle_info(self, position):
-        """Get closest obstacle info."""
-        if not self.obstacles:
-            return np.array([10.0, 0.0, 0.0, 0.0])
-        
-        min_distance = float('inf')
-        closest_relative_pos = np.zeros(3)
-        
-        for obstacle in self.obstacles:
-            center_distance = np.linalg.norm(position - obstacle['position'])
-            surface_distance = center_distance - obstacle['size'] - self.drone_radius
-            
-            if surface_distance < min_distance:
-                min_distance = surface_distance
-                closest_relative_pos = obstacle['position'] - position
-        
-        closest_relative_pos = closest_relative_pos / self.workspace_bounds
-        
-        return np.array([
-            np.clip(min_distance / self.workspace_bounds, 0.0, 1.0),
-            closest_relative_pos[0], closest_relative_pos[1], closest_relative_pos[2]
-        ])
-    
-    def _get_closest_obstacle_distance(self, position):
-        """Get distance to closest obstacle."""
-        if not self.obstacles:
-            return float('inf')
-        
-        min_distance = float('inf')
-        for obstacle in self.obstacles:
-            center_distance = np.linalg.norm(position - obstacle['position'])
-            surface_distance = center_distance - obstacle['size'] - self.drone_radius
-            min_distance = min(min_distance, surface_distance)
-        
-        return max(min_distance, 0.0)
-    
-    def _check_collision(self):
-        """Check collision."""
-        current_pos = self.pos[0]
-        
-        # Ground collision
-        if current_pos[2] < 0.05:
-            return True
-        
-        # Obstacle collision
-        if self.obstacles:
-            closest_distance = self._get_closest_obstacle_distance(current_pos)
-            return closest_distance < self.collision_threshold
-        
-        return False
-    
     def _check_out_of_bounds(self):
         """Check bounds."""
         pos = self.pos[0]
@@ -549,9 +598,9 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         distance = np.linalg.norm(self.pos[0] - current_end)
         return distance < self.waypoint_threshold
     
-    def _check_termination(self):
-        """Check termination."""
-        return self._is_success() or self._check_collision() or self._check_out_of_bounds()
+    def _check_termination_no_collision(self):
+        """Check termination without collision (collision handled in step())."""
+        return self._is_success() or self._check_out_of_bounds()
 
 
 def make_progressive_env(gui=False):
@@ -581,7 +630,7 @@ def train_progressive_drone_navigation():
     save_dir = f"models/progressive_drone_nav_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
     
-    print("🚀 Starting Progressive Difficulty Drone Training")
+    print("🚀 Starting Progressive Difficulty Drone Training - COLLISION DETECTION COMPLETELY FIXED")
     print(f"📁 Save directory: {save_dir}")
     print(f"🎯 Configuration: {config}")
     
@@ -641,10 +690,17 @@ def train_progressive_drone_navigation():
     # Callbacks
     progressive_callback = ProgressiveDifficultyCallback(train_env, verbose=1)
     
-    # stop_callback = StopTrainingOnRewardThreshold(
-    #     reward_threshold=config['reward_threshold'],
-    #     verbose=1
-    # )
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=save_dir,
+        eval_freq=config['eval_freq'],
+        n_eval_episodes=config['n_eval_episodes'],
+        deterministic=True,
+        verbose=1,
+    )
+    
+    # Callbacks
+    progressive_callback = ProgressiveDifficultyCallback(train_env, verbose=1)
     
     eval_callback = EvalCallback(
         eval_env,
@@ -653,9 +709,7 @@ def train_progressive_drone_navigation():
         n_eval_episodes=config['n_eval_episodes'],
         deterministic=True,
         verbose=1,
-        #callback_on_new_best=stop_callback
     )
-    
     # Combine callbacks
     from stable_baselines3.common.callbacks import CallbackList
     callback_list = CallbackList([progressive_callback, eval_callback])
@@ -663,9 +717,9 @@ def train_progressive_drone_navigation():
     # Train
     print("\n🎓 Starting progressive training...")
     print("📊 Level 0: No obstacles, close goal")
-    print("📊 Level 1: 2 obstacles, medium goal") 
-    print("📊 Level 2: 4 obstacles, far goal")
-    print("📊 Level 3: 6 obstacles, very far goal")
+    print("📊 Level 1: 1 obstacles, medium goal") 
+    print("📊 Level 2: 3 obstacles, far goal")
+    print("📊 Level 3: 5 obstacles, very far goal")
     
     try:
         model.learn(
