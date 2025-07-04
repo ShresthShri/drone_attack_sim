@@ -209,7 +209,7 @@ def evaluate_all_difficulties(model, env, n_episodes_per_level=5, render=False):
     print("🚀 Evaluating across all difficulty levels...")
     
     all_stats = {}
-    difficulty_levels = [0, 1, 2, 3]  # Based on your progressive environment
+    difficulty_levels = [0, 1, 2, 3, 4, 5, 6, 7]  # Extended for 8 levels
     
     for level in difficulty_levels:
         print(f"\n{'='*50}")
@@ -297,7 +297,7 @@ def plot_difficulty_comparison(all_stats, save_dir=None):
     plt.grid(True, alpha=0.3)
     
     # 5-8. Individual Difficulty Level Reward Distributions
-    for i, level in enumerate(levels):
+    for i, level in enumerate(levels[:4]):
         plt.subplot(3, 4, 5 + i)
         rewards = all_stats[level]['episode_rewards']
         plt.hist(rewards, bins=max(3, len(rewards)//2), alpha=0.7, 
@@ -401,13 +401,17 @@ def plot_trajectory_2d(stats, save_dir=None, episode_idx=0, difficulty_level=0):
     # CORRECT waypoints to match training script exactly
     start_waypoint = np.array([-1.0, -3.0, 1.0])
     end_waypoints_by_level = [
-        np.array([0.0, 1.5, 1.2]),  # Level 0
-        np.array([0.0, 2.0, 1.3]),  # Level 1
-        np.array([0.0, 2.8, 1.7]),  # Level 2
-        np.array([0.0, 3.5, 2.0])   # Level 3
+        np.array([0.0, 1.5, 1.2]),   # Level 0
+        np.array([0.0, 2.0, 1.3]),   # Level 1
+        np.array([0.5, 2.5, 1.4]),   # Level 2
+        np.array([1.0, 3.0, 1.5]),   # Level 3
+        np.array([1.5, 3.5, 1.7]),   # Level 4
+        np.array([2.0, 4.0, 1.8]),   # Level 5
+        np.array([2.5, 4.2, 2.0]),   # Level 6
+        np.array([3.0, 4.5, 2.2])    # Level 7
     ]
     end_waypoint = end_waypoints_by_level[difficulty_level]
-    workspace_bounds = 4.0
+    workspace_bounds = 5.0
     
     # Create 2D plot
     fig, ax = plt.subplots(figsize=(12, 10))
@@ -484,14 +488,14 @@ def plot_trajectory_2d(stats, save_dir=None, episode_idx=0, difficulty_level=0):
         final_distance = np.linalg.norm(trajectory[-1][:2] - end_waypoint[:2])
         
         stats_text = f"""Trajectory Stats:
-Total Distance: {total_distance:.2f}m
-Direct Distance: {direct_distance:.2f}m  
-Path Efficiency: {efficiency:.1%}
-Steps: {len(trajectory)}
-Obstacles: {len(obstacles)}
-Max Altitude: {np.max(trajectory[:, 2]):.2f}m
-Final Distance to Goal: {final_distance:.2f}m
-Obstacle Violations: {obstacle_violations}"""
+        Total Distance: {total_distance:.2f}m
+        Direct Distance: {direct_distance:.2f}m  
+        Path Efficiency: {efficiency:.1%}
+        Steps: {len(trajectory)}
+        Obstacles: {len(obstacles)}
+        Max Altitude: {np.max(trajectory[:, 2]):.2f}m
+        Final Distance to Goal: {final_distance:.2f}m
+        Obstacle Violations: {obstacle_violations}"""
         
         if min_distances:
             stats_text += f"\nClosest to Obstacle: {min(min_distances):.2f}m"
@@ -563,10 +567,14 @@ def plot_trajectory_3d(stats, save_dir=None, episode_idx=0, difficulty_level=0):
     # CORRECT waypoints to match training script exactly
     start_waypoint = np.array([-1.0, -3.0, 1.0])
     end_waypoints_by_level = [
-        np.array([0.0, 1.5, 1.2]),  # Level 0
-        np.array([0.0, 2.0, 1.3]),  # Level 1
-        np.array([0.0, 2.8, 1.7]),  # Level 2
-        np.array([0.0, 3.5, 2.0])   # Level 3
+        np.array([0.0, 1.5, 1.2]),   # Level 0
+        np.array([0.0, 2.0, 1.3]),   # Level 1
+        np.array([0.5, 2.5, 1.4]),   # Level 2
+        np.array([1.0, 3.0, 1.5]),   # Level 3
+        np.array([1.5, 3.5, 1.7]),   # Level 4
+        np.array([2.0, 4.0, 1.8]),   # Level 5
+        np.array([2.5, 4.2, 2.0]),   # Level 6
+        np.array([3.0, 4.5, 2.2])    # Level 7
     ]
     end_waypoint = end_waypoints_by_level[difficulty_level]
     workspace_bounds = 4.0
@@ -753,8 +761,16 @@ Navigation:
     
     # Enhanced title
     title = f'3D Drone Trajectory - Level {difficulty_level}, Episode {episode_idx + 1}\n'
-    level_names = {0: "Beginner (No obstacles)", 1: "Easy (1 obstacle)", 
-                  2: "Medium (3 obstacles)", 3: "Hard (5 obstacles)"}
+    level_names = {
+        0: "Beginner (No obstacles)", 
+        1: "Easy (1 obstacle)", 
+        2: "Novice (2 obstacles)",
+        3: "Intermediate (3 obstacles)", 
+        4: "Challenging (5 obstacles)",
+        5: "Advanced (6 obstacles)",
+        6: "Expert (8 obstacles)",
+        7: "Master (10 obstacles)"
+    }
     title += f'{level_names.get(difficulty_level, f"Level {difficulty_level}")}'
     ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
     
@@ -831,10 +847,14 @@ def plot_altitude_profile(stats, save_dir=None, episode_idx=0, difficulty_level=
     # Add waypoint lines
     start_waypoint = np.array([-1.0, -3.0, 1.0])
     end_waypoints_by_level = [
-        np.array([0.0, 1.5, 1.2]),  # Level 0
-        np.array([0.0, 2.0, 1.3]),  # Level 1
-        np.array([0.0, 2.8, 1.7]),  # Level 2
-        np.array([0.0, 3.5, 2.0])   # Level 3
+        np.array([0.0, 1.5, 1.2]),   # Level 0
+        np.array([0.0, 2.0, 1.3]),   # Level 1
+        np.array([0.5, 2.5, 1.4]),   # Level 2
+        np.array([1.0, 3.0, 1.5]),   # Level 3
+        np.array([1.5, 3.5, 1.7]),   # Level 4
+        np.array([2.0, 4.0, 1.8]),   # Level 5
+        np.array([2.5, 4.2, 2.0]),   # Level 6
+        np.array([3.0, 4.5, 2.2])    # Level 7
     ]
     end_waypoint = end_waypoints_by_level[difficulty_level]
     
@@ -886,7 +906,7 @@ def main():
     """Main evaluation function - ENHANCED WITH 3D VISUALIZATION."""
     
     # Configuration - UPDATE THESE PATHS
-    model_dir = "models/progressive_drone_nav_20250701_142313"  # Update with your actual timestamp
+    model_dir = "models/progressive_drone_nav_20250702_162713"  # Update with your actual timestamp
     model_path = f"{model_dir}/final_model.zip"  # or best_model.zip if you prefer
     normalize_path = f"{model_dir}/vec_normalize.pkl"
     n_episodes_per_level = 5  # Episodes to run per difficulty level
@@ -989,14 +1009,14 @@ def main():
         
         # Overall assessment
         overall_success = np.mean([stats['success_rate'] for stats in all_stats.values()])
-        hardest_level_success = all_stats[3]['success_rate']  # Level 3 (hardest)
+        hardest_level_success = all_stats[7]['success_rate']  # Level 3 (hardest)
         
         print(f"\n🏆 OVERALL ASSESSMENT:")
         print(f"   Average Success Rate: {overall_success:.1%}")
         print(f"   Hardest Level Success: {hardest_level_success:.1%}")
         
         # Check for collision detection issues
-        collision_rates = [all_stats[level]['collision_rate'] for level in [1, 2, 3]]
+        collision_rates = [all_stats[level]['collision_rate'] for level in [1, 2, 3, 4, 5, 6, 7]]
         if all(rate == 0.0 for rate in collision_rates):
             print(f"\n⚠️ WARNING: Zero collision rates detected across obstacle levels!")
             print("   This suggests collision detection may not be working properly.")

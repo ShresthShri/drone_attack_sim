@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Progressive difficulty training - start easy and increase challenge
-FIXED: Proper 3D box-sphere collision detection with guaranteed path clearance
-"""
-
+ 
 import os
 import numpy as np
 import torch
@@ -21,16 +17,16 @@ from datetime import datetime
 
 
 class ProgressiveDifficultyCallback(BaseCallback):
-    """Callback to increase difficulty during training."""
+    # This class will ensure that the environment difficulty is increased automatically during training. 
     
     def __init__(self, env, verbose=0):
         super().__init__(verbose)
         self.env = env
         self.last_difficulty_update = 0
-        
+	
+	# So every 150,000 training steps the training difficulty is increased
     def _on_step(self) -> bool:
-        # Increase difficulty every 200k steps
-        if self.num_timesteps - self.last_difficulty_update >= 200000:
+        if self.num_timesteps - self.last_difficulty_update >= 150000:
             if hasattr(self.env, 'envs'):
                 for env in self.env.envs:
                     if hasattr(env.env, 'increase_difficulty'):
@@ -59,30 +55,38 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
                  record=False):
         
         # Environment parameters
-        self.workspace_bounds = 4.0
+        self.workspace_bounds = 5.0
         self.obstacles = []
         self.obstacle_ids = []
         
         # Progressive difficulty parameters
         self.difficulty_level = 0  # Start at level 0 (easiest)
-        self.max_difficulty = 3
+        self.max_difficulty = 7
         
         # Difficulty-dependent parameters
-        self.num_obstacles_by_level = [0, 1, 3, 5]  # Start with NO obstacles
+        self.num_obstacles_by_level = [0, 1, 2, 3, 5, 6, 8, 10]  # Start with NO obstacles
         self.obstacle_sizes_by_level = [
-            [0.1, 0.15],  # Smaller obstacles at easier levels
-            [0.15, 0.2], 
-            [0.2, 0.25],  # REDUCED max size
-            [0.2, 0.3]    # REDUCED max size
+            [0.1, 0.15],   # Level 0
+            [0.15, 0.20],  # Level 1
+            [0.15, 0.20],  # Level 2
+            [0.12, 0.18],  # Level 3
+            [0.12, 0.18],  # Level 4
+            [0.10, 0.16],  # Level 5
+            [0.10, 0.15],  # Level 6
+            [0.08, 0.14]   # Level 7 (10 obstacles)
         ]
         
         # Waypoints - start closer, get further
         self.start_waypoint = np.array([-1.0, -3.0, 1.0])
         self.end_waypoints_by_level = [
-            np.array([0.0, 1.5, 1.2]),  # Level 0: Very close
-            np.array([0.0, 2.0, 1.3]),  # Level 1: Closer
-            np.array([0.0, 2.8, 1.7]),  # Level 2: Medium
-            np.array([0.0, 3.5, 2.0])   # Level 3: Far
+            np.array([0.0, 1.5, 1.2]),   # Level 0
+            np.array([0.0, 2.0, 1.3]),   # Level 1
+            np.array([0.5, 2.5, 1.4]),   # Level 2
+            np.array([1.0, 3.0, 1.5]),   # Level 3
+            np.array([1.5, 3.5, 1.7]),   # Level 4
+            np.array([2.0, 4.0, 1.8]),   # Level 5
+            np.array([2.5, 4.2, 2.0]),   # Level 6
+            np.array([3.0, 4.5, 2.2])    # Level 7
         ]
         
         self.waypoint_threshold = 0.3
@@ -91,7 +95,7 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         self.min_obstacle_distance = 0.8
         self.collision_threshold = 0.05  # REDUCED from 0.3
         self.drone_radius = 0.15         # REDUCED from 0.2
-        self.max_episode_steps = 1000
+        self.max_episode_steps = 1200
         self.current_step = 0
         
         # OPTIMIZED REWARD PARAMETERS FOR EARLY LEARNING
@@ -283,7 +287,7 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
         # 1. SUCCESS REWARD (collision already handled in step())
         if self._is_success():
             # Massive success reward with difficulty bonus
-            difficulty_bonus = self.difficulty_level * 100.0
+            difficulty_bonus = self.difficulty_level * 120.0
             efficiency_bonus = self.efficiency_bonus_scale * self._get_efficiency_metric()
             total_reward = self.success_reward + difficulty_bonus + efficiency_bonus
             print(f"SUCCESS! Level {self.difficulty_level}, Base: {self.success_reward}, "
@@ -400,7 +404,8 @@ class ProgressiveObstacleNavigationEnv(VelocityAviary):
                     min_path_clearance = min(min_path_clearance, clearance)
                 
                 # Ensure sufficient path clearance based on difficulty
-                required_clearance = [0.0, 1.2, 1.0, 0.8][self.difficulty_level]
+                base_clearance = max(0.4, 1.2 - (self.difficulty_level * 0.1))
+                required_clearance = base_clearance
                 if min_path_clearance < required_clearance:
                     continue
                 
@@ -615,14 +620,14 @@ def train_progressive_drone_navigation():
     """Training with progressive difficulty."""
     
     config = {
-        'total_timesteps': 1500000,  # Longer training for progression
+        'total_timesteps': 2500000,  # Longer training for progression
         'learning_rate': 5e-4,  # Higher learning rate for faster convergence
         'buffer_size': 500000,  # Smaller buffer for faster turnover
         'batch_size': 128,  # Smaller batches for more frequent updates
         'learning_starts': 3000,  # Start learning very early
         'eval_freq': 10000,  # More frequent evaluation
         'n_eval_episodes': 5,  # Fewer eval episodes for speed
-        'reward_threshold': 1500.0,  # Higher threshold for better performance
+        'reward_threshold': 10000.0,  # Higher threshold for better performance
         'n_envs': 8
     }
     
@@ -715,11 +720,14 @@ def train_progressive_drone_navigation():
     callback_list = CallbackList([progressive_callback, eval_callback])
    
     # Train
-    print("\n🎓 Starting progressive training...")
     print("📊 Level 0: No obstacles, close goal")
-    print("📊 Level 1: 1 obstacles, medium goal") 
-    print("📊 Level 2: 3 obstacles, far goal")
-    print("📊 Level 3: 5 obstacles, very far goal")
+    print("📊 Level 1: 1 obstacle, simple navigation") 
+    print("📊 Level 2: 2 obstacles, basic avoidance")
+    print("📊 Level 3: 3 obstacles, path planning")
+    print("📊 Level 4: 5 obstacles, complex navigation")
+    print("📊 Level 5: 6 obstacles, precision flying")
+    print("📊 Level 6: 8 obstacles, advanced scenarios")
+    print("📊 Level 7: 10 obstacles, ultimate challenge")
     
     try:
         model.learn(
