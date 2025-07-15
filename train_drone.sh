@@ -29,6 +29,6 @@ export CUDA_VISIBLE_DEVICES=0
 
 # Run training
 echo "Starting drone training..."
-python agents/train_sac.py
+python agents/baseline_RL.py
 
 echo "Job finished at: $(date)"

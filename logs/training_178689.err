@@ -1,5 +1,0 @@
-/homes/ss5921/Dissertation/drone_attack_sim/gym-pybullet-drones/gym-pybullet-drones/gym_pybullet_drones/envs/BaseAviary.py:7: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
-  import pkg_resources
-pybullet build time: Jun 27 2025 13:59:41
-/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.increase_difficulty to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.increase_difficulty` for environment variables or `env.get_wrapper_attr('increase_difficulty')` that will search the reminding wrappers.[0m
-  logger.warn(
