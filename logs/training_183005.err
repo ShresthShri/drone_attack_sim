@@ -1,0 +1,9 @@
+pybullet build time: Jun 27 2025 13:59:41
+/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/gym/spaces/box.py:127: UserWarning: [33mWARN: Box bound precision lowered by casting to float32[0m
+  logger.warn(f"Box bound precision lowered by casting to {self.dtype}")
+/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/stable_baselines3/common/vec_env/patch_gym.py:49: UserWarning: You provided an OpenAI Gym environment. We strongly recommend transitioning to Gymnasium environments. Stable-Baselines3 is automatically wrapping your environments in a compatibility layer, which could potentially cause issues.
+  warnings.warn(
+/homes/ss5921/Dissertation/drone_attack_sim/agents/ReLara_auxilary.py:92: UserWarning: Creating a tensor from a list of numpy.ndarrays is extremely slow. Please consider converting the list to a single numpy.ndarray with numpy.array() before converting to a tensor. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:254.)
+  states = torch.FloatTensor([exp['state'] for exp in batch]).to(self.device)
+/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/gym/spaces/box.py:127: UserWarning: [33mWARN: Box bound precision lowered by casting to float32[0m
+  logger.warn(f"Box bound precision lowered by casting to {self.dtype}")

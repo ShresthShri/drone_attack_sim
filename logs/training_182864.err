@@ -1,0 +1,25 @@
+pybullet build time: Jun 27 2025 13:59:41
+/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/stable_baselines3/common/vec_env/patch_gym.py:49: UserWarning: You provided an OpenAI Gym environment. We strongly recommend transitioning to Gymnasium environments. Stable-Baselines3 is automatically wrapping your environments in a compatibility layer, which could potentially cause issues.
+  warnings.warn(
+Traceback (most recent call last):
+  File "/homes/ss5921/Dissertation/drone_attack_sim/agents/curriculum_RL.py", line 1110, in <module>
+    evaluation_results = evaluate_curriculum_model()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/homes/ss5921/Dissertation/drone_attack_sim/agents/curriculum_RL.py", line 1046, in evaluate_curriculum_model
+    action, _ = model.predict(obs, deterministic=True)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/stable_baselines3/common/base_class.py", line 557, in predict
+    return self.policy.predict(observation, state, episode_start, deterministic)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/stable_baselines3/common/policies.py", line 365, in predict
+    obs_tensor, vectorized_env = self.obs_to_tensor(observation)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/stable_baselines3/common/policies.py", line 272, in obs_to_tensor
+    vectorized_env = is_vectorized_observation(observation, self.observation_space)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/stable_baselines3/common/utils.py", line 404, in is_vectorized_observation
+    return is_vec_obs_func(observation, observation_space)  # type: ignore[operator]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vol/bitbucket/ss5921/drone_venv/lib/python3.12/site-packages/stable_baselines3/common/utils.py", line 271, in is_vectorized_box_observation
+    raise ValueError(
+ValueError: Error: Unexpected observation shape (12,) for Box environment, please use (9,) or (n_env, 9) for the observation shape.

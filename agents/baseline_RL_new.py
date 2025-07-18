@@ -15,25 +15,29 @@ class AdvancedDroneEnv(gym.Env):
         
         # Environment parameters - More reasonable for learning
         self.max_speed = 4.0  # Reduced for better control
-        self.max_force = 30.0  # Reduced
+        self.max_force = 15.0  # Reduced
         self.gravity = 9.8
         self.mass = 1.0
-        self.k_p = 10.0  # Reduced for stability
-        self.k_d = 2.0   # Reduced
+        self.k_p = 5.0  # Reduced for stability
+        self.k_d = 1.0   # Reduced
         self.episode_length = 800  # Shorter episodes
-        self.goal_threshold = 1.5  # Slightly larger for easier success
+        self.goal_threshold = 2.0  # Larger threshold for easier success
         self.min_altitude = 0.3
         self.max_altitude = 8.0
         
         # Action and observation spaces - Fixed bounds
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
-        # Proper observation bounds
-        self.observation_space = spaces.Box(low=-100.0, high=100.0, shape=(9,), dtype=np.float32)
+        # Fixed observation bounds to match actual possible values
+        self.observation_space = spaces.Box(
+            low=np.array([-30, -30, 0, -15, -15, -15, -50, -50, -15]),
+            high=np.array([30, 30, 15, 15, 15, 15, 50, 50, 15]),
+            dtype=np.float32
+        )
         
         # PyBullet setup
         self.physicsClient = p.connect(p.DIRECT)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        p.setPhysicsEngineParameter(fixedTimeStep=1/120, numSubSteps=2)  # Simpler physics
+        p.setPhysicsEngineParameter(fixedTimeStep=1/60, numSubSteps=1)  # More stable physics
         
         # Environment state
         self.drone = None
@@ -156,6 +160,16 @@ class AdvancedDroneEnv(gym.Env):
             relative_goal           # Relative goal position (3)
         ]).astype(np.float32)
         
+        # Apply normalization
+        obs = self._normalize_observation(obs)
+        
+        return obs
+    
+    def _normalize_observation(self, obs):
+        # Position normalization
+        obs[:3] = obs[:3] / 20.0  # Normalize positions
+        obs[3:6] = obs[3:6] / 10.0  # Normalize velocities
+        obs[6:9] = obs[6:9] / 20.0  # Normalize relative goal
         return obs
 
     def _check_collision(self):
@@ -185,13 +199,13 @@ class AdvancedDroneEnv(gym.Env):
             distance = np.linalg.norm(drone_pos - closest_point)
             min_distance = min(min_distance, distance)
         
-        # Much gentler proximity rewards
+        # Scaled proximity rewards
         if min_distance < 0.5:
-            return -5 * (0.5 - min_distance)  # Mild penalty for very close
+            return -2.0 * (0.5 - min_distance)  # Scaled penalty for very close
         elif min_distance < 1.0:
-            return -2 * (1.0 - min_distance)  # Light penalty for close
+            return -1.0 * (1.0 - min_distance)  # Scaled penalty for close
         elif min_distance > 2.0:
-            return 1.0  # Small bonus for safe distance
+            return 0.5  # Small bonus for safe distance
         else:
             return 0  # Neutral zone
     
@@ -219,7 +233,7 @@ class AdvancedDroneEnv(gym.Env):
         
         # Get new observation
         obs = self._get_observation()
-        drone_pos = obs[:3]
+        drone_pos, _ = p.getBasePositionAndOrientation(self.drone)  # Get actual position, not normalized
         
         # Calculate distances
         distance_to_goal = np.linalg.norm(drone_pos - self.goal_pos)
@@ -231,24 +245,24 @@ class AdvancedDroneEnv(gym.Env):
         if new_best:
             self.best_distance = distance_to_goal
         
-        # IMPROVED REWARD SYSTEM
+        # IMPROVED REWARD SYSTEM - All rewards scaled to 0-10 range
         reward = 0.0
         
-        # 1. Strong progress reward - main learning signal
+        # 1. Scaled progress reward - main learning signal
         if progress > 0:
-            reward += progress * 50  # Increased reward for progress
+            reward += progress * 5  # Scaled reward for progress
         
         # 2. Distance-based reward - always positive baseline
         max_distance = 30.0  # Reasonable max distance
-        proximity_bonus = (max_distance - distance_to_goal) / max_distance * 10
+        proximity_bonus = (max_distance - distance_to_goal) / max_distance * 2
         reward += proximity_bonus
         
         # 3. Best distance achievement bonus
         if new_best:
             improvement = self.initial_distance - distance_to_goal
-            reward += improvement * 5  # Bonus for new best distance
+            reward += improvement * 2  # Scaled bonus for new best distance
         
-        # 4. Gentle proximity guidance
+        # 4. Scaled proximity guidance
         proximity_reward = self._calculate_proximity_reward(drone_pos)
         reward += proximity_reward
         
@@ -257,25 +271,25 @@ class AdvancedDroneEnv(gym.Env):
         if velocity_magnitude > 0.2:
             reward += 0.1  # Small bonus for moving
         
-        # 6. Very light time penalty
-        reward -= 0.02
+        # 6. Scaled time penalty
+        reward -= 0.05
         
         # Check termination conditions
         done = False
         collision = self._check_collision()
         
         if distance_to_goal < self.goal_threshold:
-            # Success with significant reward
-            efficiency_bonus = max(0, 50 - self.current_step / 10)
-            reward += 100 + efficiency_bonus
+            # Success with scaled reward
+            efficiency_bonus = max(0, 10 - self.current_step / 80)
+            reward += 20 + efficiency_bonus
             done = True
         elif collision:
-            reward -= 50  # Moderate collision penalty
+            reward -= 10  # Scaled collision penalty
             done = True
         elif self.current_step >= self.episode_length:
-            # Mild timeout penalty based on progress
+            # Scaled timeout penalty based on progress
             progress_ratio = 1 - (distance_to_goal / self.initial_distance)
-            reward += -10 + (progress_ratio * 20)
+            reward += -5 + (progress_ratio * 10)
             done = True
         
         self.current_step += 1
@@ -304,12 +318,12 @@ def train_advanced_drone():
         "MlpPolicy",
         env,
         verbose=1,
-        learning_rate=3e-4,
-        buffer_size=100000,  # Smaller buffer
-        learning_starts=5000,  # Earlier learning start
-        batch_size=128,      # Smaller batch size
-        tau=0.005,
-        gamma=0.99,
+        learning_rate=1e-4,
+        buffer_size=50000,  # Smaller buffer
+        learning_starts=2000,  # Earlier learning start
+        batch_size=64,      # Smaller batch size
+        tau=0.02,
+        gamma=0.95,
         ent_coef='auto',
         target_entropy='auto',
         policy_kwargs=dict(
@@ -322,16 +336,17 @@ def train_advanced_drone():
     
     print("Starting advanced drone navigation training...")
     print("Fixed Environment Issues:")
-    print("- Proper observation space bounds (-100 to 100)")
+    print("- Proper observation space bounds to match actual values")
+    print("- Consistent observation normalization applied")
+    print("- All rewards scaled to 0-10 range for stability")
+    print("- More stable physics (60Hz vs 120Hz)")
     print("- Simpler obstacle course for initial learning")
     print("- Shorter navigation distance (12-18 units vs 22-28)")
-    print("- Gentler proximity penalties (-2 to -5 vs -20)")
+    print("- Gentler proximity penalties (-1 to -2 vs -5 to -20)")
     print("- Always positive baseline reward (proximity bonus)")
-    print("- Strong progress rewards (+50 per unit progress)")
     print("- Conservative network size (256x256 vs 512x512x256)")
-    print("- Earlier learning start (5k vs 10k steps)")
-    print("- Larger goal threshold (1.5 vs 1.0)")
-    print("- More stable physics (120Hz vs 240Hz)")
+    print("- Earlier learning start (2k vs 5k steps)")
+    print("- Larger goal threshold (0.5 vs 1.0)")
     
     # Train the agent
     start_time = time.time()
